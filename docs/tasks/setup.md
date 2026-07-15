@@ -21,7 +21,9 @@
 7. Resource Graph MVP（任务 12—13）以 whole-resource 和 page-as-key 为准；byte-range interval index 只在增量阶段任务 14 实现。texture/custom range、动态 work-stealing deque、NUMA 调度、stackful fiber 均不在本轮。
 8. 所有公开持久格式使用稳定 ID、显式 schema/version、固定字节序和校验；禁止持久化指针、函数地址、进程内 slot 或不稳定枚举序号。
 9. 生产代码不得出现 `TODO`、`FIXME`、`unreachable` 代替正常错误处理、空函数、固定成功返回、睡眠模拟 I/O、仅为通过测试的分支或未接线实现。
-10. 测试替身只允许用于可控时钟、故障注入和确定性调度，且必须实现与生产接口相同的状态转换；持久性、并发性和崩溃恢复验收必须使用真实线程、真实文件系统或真实 PostgreSQL。
+10. 测试替身只允许用于可控时钟、故障注入和确定性调度，且必须实现与生产接口相同的状态转换；持久性、并发性和崩溃恢复验收必须使用真实线程、真实文件系统或真实 SQLite 数据库文件。
+11. 所有上层能力必须可在构建期裁剪。关闭 ECS、Resource Graph、Workflow 或 SQLite backend 时，不得编译对应实现、链接对应第三方库、启动线程或保留运行时初始化成本；feature 组合必须有编译和链接验证。
+12. 固定 feature 名称为 `task-graph`、`ecs`、`resource-graph`、`workflow`、`workflow-sqlite`、`workflow-archive`、`workflow-archive-http`。`resource-graph` 蕴含 `task-graph`，Workflow 后端/归档 feature 依次蕴含其前置能力；非法或缺失前置组合必须在配置期明确失败，不得静默降级。
 
 ## 3. 固定工程布局
 
@@ -73,18 +75,18 @@ examples/
 
 ## 5. 统一构建与验证契约
 
-任务 `00` 必须建立以下稳定命令，后续任务不得另造入口：
+任务 `00` 建立公共命令；任务 `17` 以前向兼容变更增加 `test-sqlite` 并移除被取代的 `test-postgres`。任务 `17` 完成后的稳定命令如下，后续任务不得另造入口：
 
 ```text
 zig build check                 # 编译公开库和示例
 zig build test                  # 单元测试与非外部服务集成测试
 zig build test-stress           # 有界、可复现的并发压力测试
-zig build test-postgres         # 启动要求由任务 16 文档定义，运行真实 PostgreSQL 集成测试
+zig build test-sqlite           # 由任务 17 建立，运行真实 SQLite 文件数据库与崩溃恢复测试
 zig build bench -Doptimize=ReleaseFast
 zig build test-all
 ```
 
-`test-all` 至少包含 check、test、test-stress；从任务 16 起还必须在检测到测试数据库配置时包含 PostgreSQL 测试，CI 的 Linux 完整作业必须提供该配置。PostgreSQL CI 接线归任务 16。所有测试随机种子失败时必须打印并可用参数重放。
+`test-all` 至少包含 check、test、test-stress；任务 17 起还必须包含不依赖外部服务的 SQLite 文件数据库测试。所有测试随机种子失败时必须打印并可用参数重放。
 
 每个任务完成前：
 
@@ -115,9 +117,9 @@ zig build test-all
 | 14 | `14-resource-incremental.md` | 13、06 |
 | 15 | `15-workflow-core.md` | 01 |
 | 16 | `16-workflow-postgres.md` | 15 |
-| 17 | `17-workflow-worker.md` | 05、15、16 |
+| 17 | `17-workflow-sqlite-worker.md` | 05、15、16 |
 | 18 | `18-activity-timer-messaging.md` | 17 |
-| 19 | `19-workflow-distributed.md` | 18 |
+| 19 | `19-workflow-local-recovery.md` | 18 |
 | 20 | `20-workflow-child-compensation.md` | 19 |
 | 21 | `21-workflow-migration-archival.md` | 20、14 |
 | 22 | `22-runtime-integration.md` | 06、07、11、14、21 |
@@ -149,7 +151,10 @@ zig build test-all
 - 架构提到 InlineExecutor 可用于“确定性执行”，但 Executor 调度 record/replay 由任务 05、ECS replay 由任务 11、Workflow history replay 由任务 15 实现；任务 22 只聚合 ReplayBundle。Inline 只保证调用线程同步执行。
 - Resource Graph 的 range 类型可保留并验证 whole/page；MVP 对不支持的任意 byte/texture/custom range必须返回明确的 `UnsupportedRange`，不能静默按 whole 处理。
 - 任务 14 完成后 byte_range 成为受支持范围；texture/custom range 仍返回 `UnsupportedRange`。
-- Workflow MVP 和分布式阶段统一采用 PostgreSQL 16+ 作为事实存储，测试使用真实 PostgreSQL；对象存储仅保存大 payload/artifact，不保存 workflow history。
+- 任务 16 已完成的 PostgreSQL backend 是被后续决策取代的过渡实现。任务 17 必须以前向变更移除 libpq、DSN、PostgreSQL CI 和对应公开入口，改用构建期可选的嵌入式 SQLite backend；不得同时维护两套未被产品验证的 backend。
+- Workflow core 不依赖数据库；`-Dworkflow=true` 只启用纯协议/replay，`-Dworkflow-sqlite=true` 才编译并链接固定版本 SQLite，且隐含启用 workflow。关闭 SQLite 后不得解析 vendor header、链接 SQLite 或创建持久化线程。
+- SQLite 只承担单机/单实例 Durable Workflow 的事实存储。首轮不实现分区、多进程 HA、远程数据库协调或 Docker 测试；这些能力必须由未来独立 backend 和新任务基于实际需求引入。
+- 大 payload/artifact 可通过可选 ArtifactStore 保存；workflow history 的索引和事务事实仍保存在 SQLite。ArtifactStore 未启用时不得引入 HTTP 或 Resource Graph 依赖。
 - `immediate` shutdown 仍不能强杀线程；它表示取消 pending、请求 running 协作取消并等待线程退出。
 - Phase 路线中的“首版”只限定算法复杂度，不允许接口后面留空实现。
 - 首版可观测性输出为 NDJSON、Chrome Trace、metrics snapshot 和 CLI inspector；Tracy、Prometheus exporter、自研 Web Inspector 为后续扩展。

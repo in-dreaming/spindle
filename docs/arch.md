@@ -75,6 +75,8 @@
 * 依赖算法；
 * 持久化模型。
 
+四套上层语义都是构建期可选能力。关闭某套能力时，其实现文件、第三方依赖、后台线程和初始化路径必须完全从产物移除；不能只保留运行时布尔分支。依赖方向仍遵守本节边界，启用组合也不得制造反向依赖。
+
 ## 2.2 CPU、阻塞和异步 I/O 分离
 
 CPU 密集任务、阻塞调用和异步 I/O 必须进入不同执行域：
@@ -2048,6 +2050,8 @@ Rollback 到 N 后重新执行。
 
 Temporal 的公开架构将 Workflow Execution 建模为可恢复执行单元，为每个执行维护 append-only event history，并可通过 replay 恢复状态；Workflow Task 会产生命令，例如启动 Timer、调度 Activity 或启动 Child Workflow。该模型可作为本模块的重要参考，但不要求原样复刻 Temporal 的全部服务规模。
 
+首版部署边界固定为单机、单个 Workflow runtime 实例，持久化使用嵌入式 SQLite。SQLite backend 是构建期可选模块，不启用 Workflow 或 SQLite 时不得引入数据库编译、链接、线程或初始化成本。多进程 HA、远程数据库协调和分区调度属于未来独立 backend，不是 SQLite MVP 的隐藏兼容目标。
+
 ## 28.2 核心原则
 
 * Workflow Logic 必须确定性；
@@ -2092,7 +2096,7 @@ pub const WorkflowInstance = struct {
 
     next_event_seq: u64,
     state_version: u64,
-    owner_epoch: u64,
+    runtime_epoch: u64,
 
     created_at: i64,
     updated_at: i64,
@@ -2278,7 +2282,6 @@ definition_version
 status
 next_event_seq
 state_version
-owner_epoch
 created_at
 updated_at
 ```
@@ -2310,9 +2313,7 @@ task_id
 workflow_id
 expected_state_version
 available_at
-lease_owner
-lease_epoch
-lease_expire_at
+runtime_epoch
 attempt
 ```
 
@@ -2385,19 +2386,17 @@ Outbox Publisher
 Operator API
 ```
 
-MVP 可放入同一个服务进程，但模块边界保持独立。
+MVP 放入同一个进程，并由 SQLite writer 串行化持久化事务；模块边界仍保持独立。
 
-## 34.2 Worker Lease
+## 34.2 本地 Runtime Epoch
 
-Task 拉取时获得 lease：
+SQLite backend 每次启动持久化递增全局 runtime epoch。Task claim 记录该 epoch：
 
 ```text
-lease_owner
-lease_epoch
-lease_expire_at
+runtime_epoch
 ```
 
-完成时必须携带 epoch，防止旧 Worker 在 lease 过期后覆盖新 Worker 的结果。
+完成时必须携带 epoch，防止崩溃前遗留执行覆盖重启后的结果。首版以 SQLite 独占 store lock 保证单实例；同一数据库的第二个活跃 runtime 必须明确返回 `WorkflowStoreInUse`，不能修改 epoch 或开始工作。
 
 ## 34.3 Workflow Task
 
@@ -2442,7 +2441,7 @@ MVP：
 
 * 数据库索引；
 * 分区；
-* `FOR UPDATE SKIP LOCKED` 或等效机制；
+* SQLite 索引和短事务 claim；
 * 批量扫描；
 * append `TimerFired`；
 * 创建 Workflow Task。
@@ -3003,7 +3002,7 @@ pub const ShutdownPolicy = enum {
 ```text
 停止接收新 Workflow/Graph
   → Workflow Worker 停止 Poll
-  → 等待或释放 Activity Lease
+  → 等待或停止领取 Activity
   → Resource Graph 停止新 Plan
   → ECS 停止 Update
   → Drain Main/Render
@@ -3087,14 +3086,15 @@ Durable Workflow 未完成状态留在数据库，进程重启后恢复。
 * Crash after commit before ACK；
 * duplicate Activity Result；
 * duplicate Signal；
-* lease expiry；
+* stale runtime epoch；
 * timer duplicate fire；
 * retry backoff；
 * compensation；
 * snapshot replay；
 * definition version mismatch；
 * outbox/inbox；
-* DB failover。
+* SQLite busy/full/corruption；
+* kill/reopen recovery。
 
 ## 49.7 Sanitizer 和 Debug
 
@@ -3311,19 +3311,20 @@ Durable Workflow 未完成状态留在数据库，进程重启后恢复。
 * Inbox/Outbox；
 * Operator API。
 
-## Phase 9：Workflow 分布式化
+## Phase 9：Workflow 本地可靠性与组合
 
 实现：
 
-* Partition；
-* Lease/Epoch；
-* Worker Queue；
+* SQLite WAL 与 schema migration；
+* 单实例 runtime epoch；
+* crash/restart recovery；
 * Child Workflow；
 * Compensation；
 * Version Migration；
 * Archival；
-* 多服务部署；
-* 高可用。
+* backup/restore 与完整性检查。
+
+多服务部署、分区和高可用仅在实际需求出现后，通过独立持久化 backend 扩展。
 
 ---
 
@@ -3473,6 +3474,8 @@ try workflow_client.signal(
 | 消息语义              | At-Least-Once + Idempotency        |
 | Timer             | 持久化 Timer                          |
 | Workflow 状态       | History + Snapshot                 |
+| Workflow MVP 存储   | 可选嵌入式 SQLite（单机）                 |
+| Feature 裁剪        | 构建期排除实现、依赖、线程和初始化成本             |
 | 调试                | Trace + Record/Replay              |
 | Fiber             | 延后                                 |
 
