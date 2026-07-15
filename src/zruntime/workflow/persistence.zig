@@ -13,8 +13,14 @@ pub const ActivityTask = struct { task_id: core.StableId, command_sequence: u64,
 pub const Timer = struct { timer_id: core.StableId, fire_at_utc_ms: i64, schema: core.schema.SchemaKey, payload: []const u8 };
 /// An outbox message which remains publishable until a publisher marks it sent.
 pub const OutboxMessage = struct { message_id: core.StableId, payload: []const u8 };
+/// An independent child instance created with its parent transition.
+pub const ChildStart = struct { workflow_id: core.StableId, task_id: core.StableId, event_id: core.StableId, definition_id: u64, definition_version: u32, schema: core.schema.SchemaKey, payload: []const u8, parent_close_policy: u8 };
+/// A child cancellation requested by its parent's deterministic transition.
+pub const ChildCancel = struct { workflow_id: core.StableId, event_id: core.StableId };
+/// A compensation activity persisted as a plan step and delivered at least once.
+pub const Compensation = struct { plan_id: core.StableId, task_id: core.StableId, command_sequence: u64, activity_type: u64, schema: core.schema.SchemaKey, payload: []const u8, input_hash: u64, index: u32 };
 /// Work produced by a deterministic transition. Every item is persisted with the history commit.
-pub const ScheduledWork = struct { next_task: ?WorkflowTask = null, activities: []const ActivityTask = &.{}, timers: []const Timer = &.{}, outbox: []const OutboxMessage = &.{} };
+pub const ScheduledWork = struct { next_task: ?WorkflowTask = null, activities: []const ActivityTask = &.{}, timers: []const Timer = &.{}, outbox: []const OutboxMessage = &.{}, children: []const ChildStart = &.{}, child_cancellations: []const ChildCancel = &.{}, compensations: []const Compensation = &.{} };
 /// The complete single-transaction input for a workflow task transition.
 pub const CommitInput = struct {
     tenant: []const u8,

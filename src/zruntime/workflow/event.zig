@@ -13,6 +13,16 @@ pub const Kind = struct {
     pub const cancellation_requested: u32 = 8;
     /// A deterministic retry decision. It is replay metadata, not workflow input.
     pub const activity_retry_scheduled: u32 = 9;
+    pub const child_started: u32 = 10;
+    pub const child_completed: u32 = 11;
+    pub const child_failed: u32 = 12;
+    pub const child_cancelled: u32 = 13;
+    pub const workflow_terminated: u32 = 14;
+    pub const compensation_plan_started: u32 = 15;
+    pub const compensation_step_completed: u32 = 16;
+    pub const compensation_step_failed: u32 = 17;
+    pub const compensation_plan_completed: u32 = 18;
+    pub const compensation_plan_failed: u32 = 19;
 };
 
 /// A schema-qualified payload which aliases caller-owned immutable bytes.

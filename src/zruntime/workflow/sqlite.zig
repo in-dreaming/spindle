@@ -48,6 +48,7 @@ pub const Commit = struct {
 };
 const migration_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v1;
 const migration_v2_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v2;
+const migration_v3_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v3;
 
 /// One SQLite connection, serialized by this store. It owns the process-local SQLite store lock.
 pub const Store = struct {
@@ -636,6 +637,8 @@ pub const Store = struct {
         if (c.sqlite3_changes(self.db) != 1) return error.Conflict;
         if (value.optional_snapshot) |saved| try self.insertSnapshot(value.tenant, value.namespace, saved);
         try self.insertScheduled(value.tenant, value.namespace, value.claim.workflow_id, value.scheduled);
+        if (value.status != .running) try self.applyParentClosePolicies(value.tenant, value.namespace, value.claim.workflow_id, value.status, value.updated_utc_ms);
+        if (value.status != .running) try self.notifyParent(value.tenant, value.namespace, value.claim.workflow_id, value.status, value.updated_utc_ms);
         const task = try self.prepare("UPDATE workflow_task SET status=CASE WHEN EXISTS(SELECT 1 FROM workflow_history WHERE tenant=?2 AND namespace=?3 AND workflow_id=?4 AND sequence>?5) THEN 'ready' ELSE 'completed' END,available_utc_ms=?6,claimed_epoch=NULL WHERE task_id=?1 AND claimed_epoch=?7;");
         defer self.finalize(task);
         try self.bindId(task, 1, value.claim.task_id);
@@ -766,6 +769,143 @@ pub const Store = struct {
             try self.bindBlob(stmt, 5, message.payload);
             _ = try self.step(stmt);
         }
+        for (scheduled.children) |value| try self.insertChild(tenant, namespace, workflow_id, value);
+        for (scheduled.child_cancellations) |value| try self.appendHistoryFact(tenant, namespace, value.workflow_id, value.event_id, event.Kind.cancellation_requested, .{ .id = 0, .version = 1 }, "", self.clock.utcNow());
+        for (scheduled.compensations) |value| try self.insertCompensation(tenant, namespace, workflow_id, value);
+    }
+    fn insertChild(self: *Store, tenant: []const u8, namespace: []const u8, parent_id: core.StableId, value: persistence.ChildStart) Error!void {
+        if (value.payload.len > max_payload_bytes) return error.PayloadTooLarge;
+        const instance_stmt = try self.prepare("INSERT OR IGNORE INTO workflow_instance(tenant,namespace,workflow_id,definition_id,definition_version,status,state,next_sequence,created_utc_ms,updated_utc_ms) VALUES(?1,?2,?3,?4,?5,'running',X'',2,?6,?6);");
+        defer self.finalize(instance_stmt);
+        try self.bindText(instance_stmt, 1, tenant);
+        try self.bindText(instance_stmt, 2, namespace);
+        try self.bindId(instance_stmt, 3, value.workflow_id);
+        try self.bindInt(instance_stmt, 4, @as(i64, @bitCast(value.definition_id)));
+        try self.bindInt(instance_stmt, 5, value.definition_version);
+        try self.bindInt(instance_stmt, 6, self.clock.utcNow());
+        _ = try self.step(instance_stmt);
+        const history = try self.prepare("INSERT OR IGNORE INTO workflow_history(tenant,namespace,workflow_id,sequence,event_id,kind,event_utc_ms,schema_id,schema_version,payload) VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,?9);");
+        defer self.finalize(history);
+        try self.bindText(history, 1, tenant);
+        try self.bindText(history, 2, namespace);
+        try self.bindId(history, 3, value.workflow_id);
+        try self.bindId(history, 4, value.event_id);
+        try self.bindInt(history, 5, event.Kind.started);
+        try self.bindInt(history, 6, self.clock.utcNow());
+        try self.bindInt(history, 7, @as(i64, @bitCast(value.schema.id)));
+        try self.bindInt(history, 8, value.schema.version);
+        try self.bindBlob(history, 9, value.payload);
+        _ = try self.step(history);
+        const task = try self.prepare("INSERT OR IGNORE INTO workflow_task(task_id,tenant,namespace,workflow_id,status,available_utc_ms) VALUES(?1,?2,?3,?4,'ready',?5);");
+        defer self.finalize(task);
+        try self.bindId(task, 1, value.task_id);
+        try self.bindText(task, 2, tenant);
+        try self.bindText(task, 3, namespace);
+        try self.bindId(task, 4, value.workflow_id);
+        try self.bindInt(task, 5, self.clock.utcNow());
+        _ = try self.step(task);
+        const relation = try self.prepare("INSERT OR IGNORE INTO workflow_child(tenant,namespace,parent_workflow_id,child_workflow_id,parent_close_policy) VALUES(?1,?2,?3,?4,?5);");
+        defer self.finalize(relation);
+        try self.bindText(relation, 1, tenant);
+        try self.bindText(relation, 2, namespace);
+        try self.bindId(relation, 3, parent_id);
+        try self.bindId(relation, 4, value.workflow_id);
+        try self.bindInt(relation, 5, value.parent_close_policy);
+        _ = try self.step(relation);
+        const raw = value.workflow_id.toBytes();
+        try self.appendHistoryFact(tenant, namespace, parent_id, derivedEventId(value.workflow_id, 10), event.Kind.child_started, @import("child.zig").schema, &raw, self.clock.utcNow());
+    }
+    fn insertCompensation(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, value: persistence.Compensation) Error!void {
+        const plan = try self.prepare("INSERT OR IGNORE INTO compensation_plan(tenant,namespace,workflow_id,plan_id,status) VALUES(?1,?2,?3,?4,'running');");
+        defer self.finalize(plan);
+        try self.bindText(plan, 1, tenant);
+        try self.bindText(plan, 2, namespace);
+        try self.bindId(plan, 3, workflow_id);
+        try self.bindId(plan, 4, value.plan_id);
+        _ = try self.step(plan);
+        const step_stmt = try self.prepare("INSERT OR IGNORE INTO compensation_step(tenant,namespace,plan_id,step_index,activity_type,schema_id,schema_version,input_hash,payload,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending');");
+        defer self.finalize(step_stmt);
+        try self.bindText(step_stmt, 1, tenant);
+        try self.bindText(step_stmt, 2, namespace);
+        try self.bindId(step_stmt, 3, value.plan_id);
+        try self.bindInt(step_stmt, 4, value.index);
+        try self.bindInt(step_stmt, 5, @as(i64, @bitCast(value.activity_type)));
+        try self.bindInt(step_stmt, 6, @as(i64, @bitCast(value.schema.id)));
+        try self.bindInt(step_stmt, 7, value.schema.version);
+        try self.bindInt(step_stmt, 8, @as(i64, @bitCast(value.input_hash)));
+        try self.bindBlob(step_stmt, 9, value.payload);
+        _ = try self.step(step_stmt);
+        const task = try self.prepare("INSERT OR IGNORE INTO activity_task(task_id,tenant,namespace,workflow_id,command_sequence,payload,schema_id,schema_version,available_utc_ms,scheduled_utc_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9);");
+        defer self.finalize(task);
+        try self.bindId(task, 1, value.task_id);
+        try self.bindText(task, 2, tenant);
+        try self.bindText(task, 3, namespace);
+        try self.bindId(task, 4, workflow_id);
+        try self.bindInt(task, 5, value.command_sequence);
+        try self.bindBlob(task, 6, value.payload);
+        try self.bindInt(task, 7, @as(i64, @bitCast(value.schema.id)));
+        try self.bindInt(task, 8, value.schema.version);
+        try self.bindInt(task, 9, self.clock.utcNow());
+        _ = try self.step(task);
+    }
+    fn notifyParent(self: *Store, tenant: []const u8, namespace: []const u8, child_id: core.StableId, status: instance.Status, utc_ms: i64) Error!void {
+        const relation = try self.prepare("SELECT parent_workflow_id FROM workflow_child WHERE tenant=?1 AND namespace=?2 AND child_workflow_id=?3 AND notification_status='pending';");
+        defer self.finalize(relation);
+        try self.bindText(relation, 1, tenant);
+        try self.bindText(relation, 2, namespace);
+        try self.bindId(relation, 3, child_id);
+        if (!try self.step(relation)) return;
+        const parent_id = self.columnId(relation, 0);
+        const raw = child_id.toBytes();
+        const kind = switch (status) {
+            .completed => event.Kind.child_completed,
+            .failed => event.Kind.child_failed,
+            .cancelled => event.Kind.child_cancelled,
+            .running => return,
+        };
+        try self.appendHistoryFact(tenant, namespace, parent_id, derivedEventId(child_id, kind), kind, @import("child.zig").schema, &raw, utc_ms);
+        try self.wakeWorkflow(tenant, namespace, parent_id, derivedEventId(child_id, kind + 1), utc_ms);
+        const update = try self.prepare("UPDATE workflow_child SET notification_status=?4 WHERE tenant=?1 AND namespace=?2 AND child_workflow_id=?3 AND notification_status='pending';");
+        defer self.finalize(update);
+        try self.bindText(update, 1, tenant);
+        try self.bindText(update, 2, namespace);
+        try self.bindId(update, 3, child_id);
+        try self.bindText(update, 4, statusText(status));
+        _ = try self.step(update);
+    }
+    fn applyParentClosePolicies(self: *Store, tenant: []const u8, namespace: []const u8, parent_id: core.StableId, _: instance.Status, utc_ms: i64) Error!void {
+        const rows = try self.prepare("SELECT child_workflow_id,parent_close_policy FROM workflow_child WHERE tenant=?1 AND namespace=?2 AND parent_workflow_id=?3 AND notification_status='pending';");
+        defer self.finalize(rows);
+        try self.bindText(rows, 1, tenant);
+        try self.bindText(rows, 2, namespace);
+        try self.bindId(rows, 3, parent_id);
+        while (try self.step(rows)) {
+            const child_id = self.columnId(rows, 0);
+            const policy = self.columnInt(rows, 1);
+            if (policy == 2) {
+                try self.appendHistoryFact(tenant, namespace, child_id, derivedEventId(parent_id, 2), event.Kind.cancellation_requested, .{ .id = 0, .version = 1 }, "", utc_ms);
+                try self.wakeWorkflow(tenant, namespace, child_id, derivedEventId(parent_id, 4), utc_ms);
+            } else if (policy == 3) {
+                try self.appendHistoryFact(tenant, namespace, child_id, derivedEventId(parent_id, 3), event.Kind.workflow_terminated, .{ .id = 0, .version = 1 }, "", utc_ms);
+                const update = try self.prepare("UPDATE workflow_instance SET status='cancelled',updated_utc_ms=?4 WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running';");
+                defer self.finalize(update);
+                try self.bindText(update, 1, tenant);
+                try self.bindText(update, 2, namespace);
+                try self.bindId(update, 3, child_id);
+                try self.bindInt(update, 4, utc_ms);
+                _ = try self.step(update);
+            }
+        }
+    }
+    fn wakeWorkflow(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, task_id: core.StableId, utc_ms: i64) Error!void {
+        const wake = try self.prepare("INSERT INTO workflow_task(task_id,tenant,namespace,workflow_id,status,available_utc_ms) SELECT ?1,?2,?3,?4,'ready',?5 WHERE NOT EXISTS(SELECT 1 FROM workflow_task WHERE tenant=?2 AND namespace=?3 AND workflow_id=?4 AND status IN ('ready','claimed'));");
+        defer self.finalize(wake);
+        try self.bindId(wake, 1, task_id);
+        try self.bindText(wake, 2, tenant);
+        try self.bindText(wake, 3, namespace);
+        try self.bindId(wake, 4, workflow_id);
+        try self.bindInt(wake, 5, utc_ms);
+        _ = try self.step(wake);
     }
     fn finishExternal(self: *Store, comptime table: []const u8, comptime id_column: []const u8, id: core.StableId, workflow_id: core.StableId, epoch: u64, tenant: []const u8, namespace: []const u8, kind: u32, schema: core.schema.SchemaKey, payload: []const u8) Error!void {
         if (payload.len > max_payload_bytes) return error.PayloadTooLarge;
@@ -850,6 +990,7 @@ pub const Store = struct {
         try self.exec("CREATE TABLE IF NOT EXISTS spindle_schema_migration(version INTEGER PRIMARY KEY,checksum INTEGER NOT NULL) STRICT;");
         try self.applyOneMigration(1, migration_sql);
         try self.applyOneMigration(2, migration_v2_sql);
+        try self.applyOneMigration(3, migration_v3_sql);
     }
     fn recoverClaims(self: *Store) Error!store_health.Recovery {
         var recovery = store_health.Recovery{};
@@ -872,7 +1013,8 @@ pub const Store = struct {
     fn migrationHashesValid(self: *Store) bool {
         const first = self.migrationMatches(1, migration_sql) catch return false;
         const second = self.migrationMatches(2, migration_v2_sql) catch return false;
-        return first and second;
+        const third = self.migrationMatches(3, migration_v3_sql) catch return false;
+        return first and second and third;
     }
     fn migrationMatches(self: *Store, version: i64, sql: []const u8) Error!bool {
         const statement = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=?1;");

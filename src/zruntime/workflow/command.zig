@@ -10,6 +10,7 @@ pub const Kind = struct {
     pub const complete: u32 = 5;
     pub const fail: u32 = 6;
     pub const compensate: u32 = 7;
+    pub const cancel_child: u32 = 8;
 };
 
 /// Deterministic command emitted by a transition. Sequence starts at one per workflow task.

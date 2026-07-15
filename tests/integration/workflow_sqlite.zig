@@ -220,6 +220,54 @@ test "sqlite migration idempotency and workflow start use a real file" {
     try std.testing.expectEqual(login.definition_id, value.definition_id);
 }
 
+test "child creation completion notification and parent resume are transactional" {
+    const file = ".zig-cache/workflow-child.db";
+    cleanup(file);
+    defer cleanup(file);
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 1900);
+    var ids: Ids = .{};
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    defer store.deinit();
+    const schema = spindle.core.schema.SchemaKey{ .id = 0x6368_696c_645f_7465, .version = 1 };
+    const child_definition = spindle.workflow.Definition{ .id = 701, .stable_name = "test.child", .version = 1, .schemas = .{ .state = schema, .event = schema, .command = schema }, .transition = struct {
+        fn transition(_: *spindle.workflow.definition.WorkflowContext, _: []const u8, input: spindle.workflow.event.Event) !spindle.workflow.definition.Outcome {
+            return .{ .new_state = if (input.kind == spindle.workflow.event.Kind.started) "child-done" else "child-cancelled", .status = if (input.kind == spindle.workflow.event.Kind.started) .completed else .cancelled };
+        }
+    }.transition };
+    const parent_definition = spindle.workflow.Definition{ .id = 700, .stable_name = "test.parent", .version = 1, .schemas = .{ .state = schema, .event = schema, .command = schema }, .transition = struct {
+        const child_start_payload = spindle.workflow.child.encodeStart("child-input", .{ .definition_id = 701, .definition_version = 1, .input = .{ .schema = .{ .id = 0x6368_696c_645f_7465, .version = 1 }, .bytes = "child-input" }, .parent_close_policy = .request_cancel });
+        fn transition(context: *spindle.workflow.definition.WorkflowContext, _: []const u8, input: spindle.workflow.event.Event) !spindle.workflow.definition.Outcome {
+            if (input.kind == spindle.workflow.event.Kind.started) {
+                try context.commands.emit(spindle.workflow.command.Kind.start_child, .{ .schema = spindle.workflow.child.schema, .bytes = &child_start_payload });
+                return .{ .new_state = "waiting" };
+            }
+            if (input.kind == spindle.workflow.event.Kind.child_completed) return .{ .new_state = "parent-done", .status = .completed };
+            return .{ .new_state = "waiting" };
+        }
+    }.transition };
+    const client = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    const parent_id = try client.start(.{ .definition_name = "test.parent", .definition = parent_definition, .input = .{ .schema = schema, .bytes = "" }, .tenant = "child", .namespace = "test", .idempotency_key = "parent", .utc_ms = 1900 });
+    var registry = spindle.workflow.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.register(parent_definition);
+    try registry.register(child_definition);
+    registry.freeze();
+    const worker = spindle.workflow.sqlite_worker.Worker{ .allocator = std.testing.allocator, .store = &store, .registry = &registry, .tenant = "child", .namespace = "test" };
+    try std.testing.expect(try worker.runOne());
+    const child_id = spindle.core.StableId{ .high = parent_id.high, .low = parent_id.low ^ ((@as(u64, 1) << 32 | 1) ^ (@as(u64, spindle.workflow.command.Kind.start_child) << 32)) };
+    const child = try store.getInstance("child", "test", child_id);
+    defer std.testing.allocator.free(child.state);
+    try std.testing.expectEqual(@as(u64, 701), child.definition_id);
+    try std.testing.expectEqual(@as(u32, 1), child.definition_version);
+    var ran: usize = 1;
+    while (try worker.runOne()) : (ran += 1) {}
+    try std.testing.expect(ran >= 3);
+    const parent = try store.getInstance("child", "test", parent_id);
+    defer std.testing.allocator.free(parent.state);
+    try std.testing.expectEqual(spindle.workflow.instance.Status.completed, parent.status);
+    try std.testing.expectEqualStrings("parent-done", parent.state);
+}
+
 test "sqlite migrations serialize and reject modified checksums" {
     const file = ".zig-cache/workflow-sqlite-migration.db";
     cleanup(file);
@@ -677,7 +725,7 @@ test "store health reports deterministic claim recovery and clean shutdown state
     defer reopened.deinit();
     const report = try reopened.health();
     try std.testing.expect(report.previous_shutdown_clean);
-    try std.testing.expectEqual(@as(u32, 2), report.schema_version);
+    try std.testing.expectEqual(@as(u32, 3), report.schema_version);
     try std.testing.expect(report.migration_hashes_valid);
     try std.testing.expectEqual(@as(u64, 1), report.recovery.workflow_tasks);
     try std.testing.expectEqual(spindle.workflow.store_health.Integrity.repairable_queue_state, report.integrity);

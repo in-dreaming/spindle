@@ -16,6 +16,18 @@ test "workflow worker checkpoints terminal decision state" {
     try std.testing.expect(spindle.workflow.snapshot.verify(result.optional_snapshot.?));
 }
 
+test "child protocol encoding and lifecycle event IDs are stable" {
+    const child = spindle.workflow.child;
+    const encoded = child.encodeStart("input", .{ .definition_id = 0x0102_0304_0506_0708, .definition_version = 9, .input = .{ .schema = .{ .id = 10, .version = 11 }, .bytes = "input" }, .parent_close_policy = .request_cancel });
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 11, 2, 'i', 'n', 'p', 'u', 't' }, &encoded);
+    const decoded = try child.decodeStart(&encoded);
+    try std.testing.expectEqual(@as(u64, 0x0102_0304_0506_0708), decoded.definition_id);
+    try std.testing.expectEqual(child.ParentClosePolicy.request_cancel, decoded.parent_close_policy);
+    try std.testing.expectEqual(@as(u32, 10), spindle.workflow.event.Kind.child_started);
+    try std.testing.expectEqual(@as(u32, 19), spindle.workflow.event.Kind.compensation_plan_failed);
+    try std.testing.expectError(error.InvalidChildCommand, child.decodeStart("bad"));
+}
+
 test "workflow snapshot tail and full history reach identical output" {
     const Event = spindle.workflow.event.Event;
     const payload = spindle.workflow.event.Payload{ .schema = login_workflow.event_schema, .bytes = "" };

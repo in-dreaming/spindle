@@ -5,6 +5,8 @@ const event = @import("event.zig");
 const instance = @import("instance.zig");
 const persistence = @import("persistence.zig");
 const snapshot = @import("snapshot.zig");
+const child = @import("child.zig");
+const core = @import("../core/root.zig");
 
 pub const checkpoint_interval: u64 = 64;
 pub const Error = error{ UnsupportedCommand, CommandCapacityExceeded, CommandSequenceOverflow, NonDecisionEvent, DefinitionUnavailable };
@@ -27,7 +29,7 @@ pub fn processDecisions(def: definition.Definition, workflow_id: @import("../cor
     for (decisions) |decision| {
         if (decision.sequence != expected) return error.InvalidSequence;
         expected += 1;
-        if (decision.kind == event.Kind.activity_retry_scheduled) continue;
+        if (isMetadataEvent(decision.kind)) continue;
         if (!isDecisionEvent(decision.kind)) return error.NonDecisionEvent;
         var context = definition.WorkflowContext{ .logical_utc_ms = decision.utc_ms, .random_values = &.{}, .commands = &output };
         const result = try def.transition(&context, state, decision);
@@ -52,7 +54,15 @@ pub fn needsCheckpointForState(previous_snapshot_sequence: u64, processed_sequen
 /// Returns true only for history records that drive a deterministic workflow transition.
 pub fn isDecisionEvent(kind: u32) bool {
     return switch (kind) {
-        event.Kind.started, event.Kind.signal_received, event.Kind.activity_completed, event.Kind.activity_failed, event.Kind.timer_fired, event.Kind.cancellation_requested => true,
+        event.Kind.started, event.Kind.signal_received, event.Kind.activity_completed, event.Kind.activity_failed, event.Kind.timer_fired, event.Kind.cancellation_requested, event.Kind.child_completed, event.Kind.child_failed, event.Kind.child_cancelled => true,
+        else => false,
+    };
+}
+
+/// Metadata facts are persisted for diagnosis and replay validation but do not invoke user code.
+pub fn isMetadataEvent(kind: u32) bool {
+    return switch (kind) {
+        event.Kind.activity_retry_scheduled, event.Kind.child_started, event.Kind.workflow_terminated, event.Kind.compensation_plan_started, event.Kind.compensation_step_completed, event.Kind.compensation_step_failed, event.Kind.compensation_plan_completed, event.Kind.compensation_plan_failed => true,
         else => false,
     };
 }
@@ -66,13 +76,19 @@ pub fn processRegisteredDecisions(registry: *const definition.Registry, definiti
 
 /// Converts deterministic commands into Task 17 persistence work. Activities, timers, and outbox records
 /// are persisted only; this worker never executes or publishes them.
-pub fn normalizeCommands(allocator: std.mem.Allocator, workflow_id: @import("../core/stable_id.zig").StableId, decision_sequence: u64, scheduled_utc_ms: i64, commands: []const command.Command) (Error || std.mem.Allocator.Error || error{InvalidTimerCommand})!persistence.ScheduledWork {
+pub fn normalizeCommands(allocator: std.mem.Allocator, workflow_id: @import("../core/stable_id.zig").StableId, decision_sequence: u64, scheduled_utc_ms: i64, commands: []const command.Command) (Error || std.mem.Allocator.Error || error{ InvalidTimerCommand, InvalidChildCommand })!persistence.ScheduledWork {
     var activities: std.ArrayListUnmanaged(persistence.ActivityTask) = .empty;
     errdefer activities.deinit(allocator);
     var timers: std.ArrayListUnmanaged(persistence.Timer) = .empty;
     errdefer timers.deinit(allocator);
     var outbox: std.ArrayListUnmanaged(persistence.OutboxMessage) = .empty;
     errdefer outbox.deinit(allocator);
+    var children: std.ArrayListUnmanaged(persistence.ChildStart) = .empty;
+    errdefer children.deinit(allocator);
+    var child_cancellations: std.ArrayListUnmanaged(persistence.ChildCancel) = .empty;
+    errdefer child_cancellations.deinit(allocator);
+    var compensations: std.ArrayListUnmanaged(persistence.Compensation) = .empty;
+    errdefer compensations.deinit(allocator);
     for (commands) |value| {
         if (decision_sequence > std.math.maxInt(u32) or value.sequence > std.math.maxInt(u32)) return error.CommandSequenceOverflow;
         const global_sequence = (decision_sequence << 32) | value.sequence;
@@ -85,11 +101,16 @@ pub fn normalizeCommands(allocator: std.mem.Allocator, workflow_id: @import("../
                 try timers.append(allocator, .{ .timer_id = id, .fire_at_utc_ms = std.math.add(i64, scheduled_utc_ms, delay) catch std.math.maxInt(i64), .schema = value.payload.schema, .payload = timer.payload });
             },
             command.Kind.send_signal => try outbox.append(allocator, .{ .message_id = id, .payload = value.payload.bytes }),
-            command.Kind.start_child => return error.UnsupportedCommand,
+            command.Kind.start_child => {
+                const decoded = try child.decodeStart(value.payload.bytes);
+                try children.append(allocator, .{ .workflow_id = derivedId(workflow_id, global_sequence, value.kind), .task_id = derivedId(workflow_id, global_sequence, value.kind + 1), .event_id = derivedId(workflow_id, global_sequence, value.kind + 2), .definition_id = decoded.definition_id, .definition_version = decoded.definition_version, .schema = decoded.input.schema, .payload = decoded.input.bytes, .parent_close_policy = @intFromEnum(decoded.parent_close_policy) });
+            },
+            command.Kind.cancel_child => try child_cancellations.append(allocator, .{ .workflow_id = try child.decodeCancel(value.payload.bytes), .event_id = derivedId(workflow_id, global_sequence, value.kind) }),
+            command.Kind.compensate => try compensations.append(allocator, .{ .plan_id = derivedId(workflow_id, decision_sequence, command.Kind.compensate), .task_id = id, .command_sequence = global_sequence, .activity_type = value.payload.schema.id, .schema = value.payload.schema, .payload = value.payload.bytes, .input_hash = core.hash.content(value.payload.bytes), .index = @intCast(value.sequence) }),
             else => {},
         }
     }
-    return .{ .activities = try activities.toOwnedSlice(allocator), .timers = try timers.toOwnedSlice(allocator), .outbox = try outbox.toOwnedSlice(allocator) };
+    return .{ .activities = try activities.toOwnedSlice(allocator), .timers = try timers.toOwnedSlice(allocator), .outbox = try outbox.toOwnedSlice(allocator), .children = try children.toOwnedSlice(allocator), .child_cancellations = try child_cancellations.toOwnedSlice(allocator), .compensations = try compensations.toOwnedSlice(allocator) };
 }
 
 /// Releases collections returned by normalizeCommands. Payload bytes remain borrowed.
@@ -97,6 +118,9 @@ pub fn deinitScheduledWork(allocator: std.mem.Allocator, value: *persistence.Sch
     allocator.free(value.activities);
     allocator.free(value.timers);
     allocator.free(value.outbox);
+    allocator.free(value.children);
+    allocator.free(value.child_cancellations);
+    allocator.free(value.compensations);
     value.* = .{};
 }
 
