@@ -139,3 +139,72 @@ test "cancellation wakes a thread already blocked on an event" {
     try completed.acquire(spindle.platform.park.deadlineAfter(std.time.ns_per_s), .{});
     try std.testing.expectEqual(@as(u32, 2), result.load(.acquire));
 }
+
+test "concurrent queues distinguish full empty and closed while draining" {
+    const Spsc = spindle.concurrent.SpscQueue(u32);
+    var spsc = try Spsc.init(std.testing.allocator, 3);
+    defer spsc.deinit(struct {
+        fn dispose(_: u32) void {}
+    }.dispose);
+    try spsc.tryPush(1);
+    try spsc.tryPush(2);
+    try spsc.tryPush(3);
+    try std.testing.expectError(error.Full, spsc.tryPush(4));
+    try std.testing.expectEqual(@as(u32, 1), try spsc.tryPop());
+    try spsc.tryPush(4);
+    spsc.close();
+    try std.testing.expectError(error.Closed, spsc.tryPush(5));
+    try std.testing.expectEqual(@as(u32, 2), try spsc.tryPop());
+    try std.testing.expectEqual(@as(u32, 3), try spsc.tryPop());
+    try std.testing.expectEqual(@as(u32, 4), try spsc.tryPop());
+    try std.testing.expectError(error.Closed, spsc.tryPop());
+
+    const Mpmc = spindle.concurrent.MpmcQueue(u32);
+    try std.testing.expectError(error.InvalidCapacity, Mpmc.init(std.testing.allocator, 3));
+    var mpmc = try Mpmc.init(std.testing.allocator, 2);
+    defer mpmc.deinit(struct {
+        fn dispose(_: u32) void {}
+    }.dispose);
+    try mpmc.tryPush(7);
+    try mpmc.tryPush(8);
+    try std.testing.expectError(error.Full, mpmc.tryPush(9));
+    try std.testing.expectEqual(@as(u32, 7), try mpmc.tryPop());
+    try std.testing.expectEqual(@as(u32, 8), try mpmc.tryPop());
+    try std.testing.expectError(error.Empty, mpmc.tryPop());
+}
+
+test "work stealing deque and intrusive list retain ownership invariants" {
+    const Deque = spindle.concurrent.WorkStealingDeque(u8);
+    try std.testing.expectError(error.InvalidCapacity, Deque.init(std.testing.allocator, 1));
+    var deque = try Deque.init(std.testing.allocator, 2);
+    defer deque.deinit(struct {
+        fn dispose(_: u8) void {}
+    }.dispose);
+    try deque.pushBottom(1);
+    try deque.pushBottom(2);
+    try std.testing.expectError(error.Full, deque.pushBottom(3));
+    try std.testing.expectEqual(@as(u8, 1), try deque.stealTop());
+    try std.testing.expectEqual(@as(u8, 2), try deque.popBottom());
+    var list: spindle.concurrent.IntrusiveList = .{};
+    var a: spindle.concurrent.Link = .{};
+    var b: spindle.concurrent.Link = .{};
+    try list.pushBack(&a);
+    try list.pushFront(&b);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expect(list.popFront() == &b);
+    try list.remove(&a);
+    try std.testing.expect(list.isEmpty());
+}
+
+test "slab validates capacity, alignment, and double free" {
+    const Item = extern struct { value: u64 align(16) };
+    const TestSlab = spindle.concurrent.Slab(Item);
+    var slab = try TestSlab.init(std.testing.allocator, 2);
+    defer slab.deinit(struct {
+        fn dispose(_: *Item) void {}
+    }.dispose);
+    const item = try slab.acquire();
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(item) % @alignOf(Item));
+    try slab.release(item);
+    try std.testing.expectError(error.DoubleFree, slab.release(item));
+}

@@ -44,3 +44,73 @@ test "stable id generator produces one million unique concurrent identifiers" {
         try std.testing.expect(!std.meta.eql(next, previous));
     }
 }
+
+const QueueProducer = struct {
+    queue: *spindle.concurrent.MpmcQueue(u32),
+    start: u32,
+    count: u32,
+    fn run(self: @This()) void {
+        for (0..self.count) |i| {
+            const value = self.start + @as(u32, @intCast(i));
+            while (true) {
+                self.queue.tryPush(value) catch |err| switch (err) {
+                    error.Full => {
+                        std.atomic.spinLoopHint();
+                        continue;
+                    },
+                    error.Closed => return,
+                };
+                break;
+            }
+        }
+    }
+};
+const QueueConsumer = struct {
+    queue: *spindle.concurrent.MpmcQueue(u32),
+    seen: []std.atomic.Value(bool),
+    consumed: *std.atomic.Value(u32),
+    total: u32,
+    fn run(self: @This()) void {
+        while (self.consumed.load(.acquire) < self.total) {
+            const value = self.queue.tryPop() catch |err| switch (err) {
+                error.Empty => {
+                    std.atomic.spinLoopHint();
+                    continue;
+                },
+                error.Closed => return,
+            };
+            if (self.seen[value].cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) @panic("duplicate queue value");
+            _ = self.consumed.fetchAdd(1, .release);
+        }
+    }
+};
+
+test "mpmc queue conserves bounded concurrent values" {
+    const producers = 4;
+    const consumers = 4;
+    const each: u32 = 20_000;
+    const total = producers * each;
+    var queue = try spindle.concurrent.MpmcQueue(u32).init(std.testing.allocator, 1024);
+    defer queue.deinit(struct {
+        fn dispose(_: u32) void {}
+    }.dispose);
+    const seen = try std.testing.allocator.alloc(std.atomic.Value(bool), total);
+    defer std.testing.allocator.free(seen);
+    for (seen) |*entry| entry.* = .init(false);
+    var consumed: std.atomic.Value(u32) = .init(0);
+    var threads: [producers + consumers]std.Thread = undefined;
+    for (0..producers) |i| {
+        const producer: QueueProducer = .{ .queue = &queue, .start = @as(u32, @intCast(i * each)), .count = each };
+        threads[i] = try std.Thread.spawn(.{}, QueueProducer.run, .{producer});
+    }
+    for (0..consumers) |i| {
+        const consumer: QueueConsumer = .{ .queue = &queue, .seen = seen, .consumed = &consumed, .total = total };
+        threads[producers + i] = try std.Thread.spawn(.{}, QueueConsumer.run, .{consumer});
+    }
+    for (threads[0..producers]) |thread| thread.join();
+    while (consumed.load(.acquire) != total) std.Thread.yield() catch {};
+    queue.close();
+    for (threads[producers..]) |thread| thread.join();
+    try std.testing.expectEqual(total, consumed.load(.acquire));
+    for (seen) |entry| try std.testing.expect(entry.load(.acquire));
+}
