@@ -14,6 +14,18 @@ fn cleanup(path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(io, wal) catch {};
     const shm = std.fmt.bufPrint(&buffer, "{s}-shm", .{path}) catch return;
     std.Io.Dir.cwd().deleteFile(io, shm) catch {};
+    const failed = std.fmt.bufPrint(&buffer, "{s}.failed", .{path}) catch return;
+    std.Io.Dir.cwd().deleteFile(io, failed) catch {};
+}
+
+fn execRaw(path: []const u8, sql: [*:0]const u8) !void {
+    const zpath = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(zpath);
+    var raw: ?*c.sqlite3 = null;
+    if (c.sqlite3_open_v2(zpath.ptr, &raw, c.SQLITE_OPEN_READWRITE, null) != c.SQLITE_OK) return error.DatabaseFailure;
+    const db = raw orelse return error.DatabaseFailure;
+    defer _ = c.sqlite3_close_v2(db);
+    if (c.sqlite3_exec(db, sql, null, null, null) != c.SQLITE_OK) return error.DatabaseFailure;
 }
 
 fn corruptMigrationChecksum(path: []const u8) !void {
@@ -647,4 +659,72 @@ test "real subprocess activity timer and outbox crash stages recover" {
             try recovered.finishOutbox(claim);
         }
     }
+}
+
+test "store health reports deterministic claim recovery and clean shutdown state" {
+    const file = ".zig-cache/workflow-store-health.db";
+    cleanup(file);
+    defer cleanup(file);
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 1600);
+    var ids: Ids = .{};
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    const client = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    _ = try client.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "health" }, .tenant = "health", .namespace = "test", .idempotency_key = "health", .utc_ms = 1600 });
+    _ = (try store.claimWorkflowTask("health", "test")).?;
+    store.deinit();
+
+    var reopened = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    defer reopened.deinit();
+    const report = try reopened.health();
+    try std.testing.expect(report.previous_shutdown_clean);
+    try std.testing.expectEqual(@as(u32, 2), report.schema_version);
+    try std.testing.expect(report.migration_hashes_valid);
+    try std.testing.expectEqual(@as(u64, 1), report.recovery.workflow_tasks);
+    try std.testing.expectEqual(spindle.workflow.store_health.Integrity.repairable_queue_state, report.integrity);
+}
+
+test "online backup validates and offline restore preserves replaced database" {
+    const file = ".zig-cache/workflow-backup-source.db";
+    const backup = ".zig-cache/workflow-backup-copy.db";
+    cleanup(file);
+    cleanup(backup);
+    defer cleanup(file);
+    defer cleanup(backup);
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 1700);
+    var ids: Ids = .{};
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    const client = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    const workflow_id = try client.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "backup" }, .tenant = "backup", .namespace = "test", .idempotency_key = "backup", .utc_ms = 1700 });
+    try store.backup(backup);
+    const maintenance = try store.maintain(.{ .checkpoint = true, .incremental_vacuum_pages = 1 });
+    try std.testing.expect(maintenance.checkpointed);
+    store.deinit();
+    var restored = try spindle.workflow.sqlite.Store.restoreOffline(std.testing.allocator, file, backup, clock_source.clock());
+    defer restored.deinit();
+    const value = try restored.getInstance("backup", "test", workflow_id);
+    defer std.testing.allocator.free(value.state);
+    try std.testing.expectEqualStrings("", value.state);
+    const report = try restored.health();
+    try std.testing.expect(report.database_bytes != 0);
+}
+
+test "health classifies checksum corruption and maintenance cancellation" {
+    const file = ".zig-cache/workflow-health-corrupt.db";
+    cleanup(file);
+    defer cleanup(file);
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 1800);
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    const Cancel = struct {
+        fn requested(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.MaintenanceCancelled, store.maintain(.{ .cancelled = Cancel.requested }));
+    store.deinit();
+    try execRaw(file, "INSERT INTO workflow_snapshot(tenant,namespace,workflow_id,event_sequence,definition_version,state,checksum) VALUES('bad','test',X'00000000000000000000000000000001',1,1,X'BAAD',0);");
+    var reopened = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    defer reopened.deinit();
+    const report = try reopened.health();
+    try std.testing.expectEqual(@as(u64, 1), report.snapshot_checksum_failures);
+    try std.testing.expectEqual(spindle.workflow.store_health.Integrity.corrupt, report.integrity);
 }

@@ -5,13 +5,14 @@ const event = @import("event.zig");
 const instance = @import("instance.zig");
 const persistence = @import("persistence.zig");
 const snapshot = @import("snapshot.zig");
+const store_health = @import("store_health.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
 const sqlite_transient: c.sqlite3_destructor_type = @ptrFromInt(std.math.maxInt(usize));
 
 pub const max_payload_bytes: usize = 1024 * 1024;
-pub const Error = error{ WorkflowStoreInUse, MigrationMismatch, CorruptSchema, PayloadTooLarge, IdempotencyConflict, NotFound, StaleRuntimeEpoch, Conflict, DatabaseBusy, DatabaseFull, DatabaseIo, DatabaseFailure };
+pub const Error = error{ WorkflowStoreInUse, MigrationMismatch, CorruptSchema, PayloadTooLarge, IdempotencyConflict, NotFound, StaleRuntimeEpoch, Conflict, DatabaseBusy, DatabaseFull, DatabaseIo, DatabaseReadOnly, DatabaseFailure, BackupInterrupted, MaintenanceCancelled, RestoreFailed };
 pub const InstanceRecord = struct { id: core.StableId, definition_id: u64, definition_version: u32, status: instance.Status, state_version: u64, state: []u8 };
 pub const Claim = struct { task_id: core.StableId, workflow_id: core.StableId, state_version: u64, definition_id: u64, definition_version: u32, runtime_epoch: u64 };
 pub const ActivityClaim = struct { allocator: std.mem.Allocator, task_id: core.StableId, workflow_id: core.StableId, command_sequence: u64, attempt: u32, runtime_epoch: u64, scheduled_utc_ms: i64, started_utc_ms: i64, payload: []u8, schema: core.schema.SchemaKey };
@@ -51,13 +52,20 @@ const migration_v2_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v
 /// One SQLite connection, serialized by this store. It owns the process-local SQLite store lock.
 pub const Store = struct {
     allocator: std.mem.Allocator,
+    path: []u8,
     db: *c.sqlite3,
     clock: core.Clock,
     mutex: std.atomic.Mutex = .unlocked,
     runtime_epoch: u64,
     dispatcher: executor.BlockingExecutor,
+    previous_shutdown_clean: bool = false,
+    recovery: store_health.Recovery = .{},
+    clean_shutdown_written: bool = false,
+    initialized: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, clock: core.Clock) Error!Store {
+        const owned_path = allocator.dupe(u8, path) catch return error.DatabaseFailure;
+        errdefer allocator.free(owned_path);
         const zpath = allocator.dupeZ(u8, path) catch return error.DatabaseFailure;
         defer allocator.free(zpath);
         var raw: ?*c.sqlite3 = null;
@@ -71,9 +79,11 @@ pub const Store = struct {
             _ = c.sqlite3_close_v2(db);
             return error.DatabaseFailure;
         };
-        var self = Store{ .allocator = allocator, .db = db, .clock = clock, .runtime_epoch = 0, .dispatcher = dispatcher };
+        var self = Store{ .allocator = allocator, .path = &.{}, .db = db, .clock = clock, .runtime_epoch = 0, .dispatcher = dispatcher };
         errdefer self.deinit();
         try self.invoke(Store.initialize, .{});
+        self.path = owned_path;
+        self.initialized = true;
         return self;
     }
 
@@ -87,19 +97,130 @@ pub const Store = struct {
         self.beginExclusive() catch |err| return if (err == error.DatabaseBusy) error.WorkflowStoreInUse else err;
         errdefer self.rollback();
         self.applyMigration() catch |err| return if (err == error.DatabaseBusy) error.WorkflowStoreInUse else err;
+        self.previous_shutdown_clean = (try self.metadataU64("clean_shutdown")) != 0;
         const previous = try self.metadataU64("runtime_epoch");
         self.runtime_epoch = previous + 1;
         try self.setMetadataU64("runtime_epoch", self.runtime_epoch);
+        try self.setMetadataU64("clean_shutdown", 0);
+        self.recovery = try self.recoverClaims();
         try self.commit();
     }
 
     pub fn deinit(self: *Store) void {
         self.invoke(Store.close, .{}) catch {};
         self.dispatcher.deinit();
+        self.allocator.free(self.path);
         self.* = undefined;
     }
     fn close(self: *Store) Error!void {
+        if (self.initialized and !self.clean_shutdown_written) self.markCleanShutdown() catch {};
         if (c.sqlite3_close_v2(self.db) != c.SQLITE_OK) return error.DatabaseFailure;
+    }
+    fn markCleanShutdown(self: *Store) Error!void {
+        try self.begin();
+        errdefer self.rollback();
+        try self.setMetadataU64("clean_shutdown", 1);
+        try self.commit();
+        self.clean_shutdown_written = true;
+    }
+
+    /// Runs payload-free integrity diagnostics. It never repairs or mutates workflow facts.
+    pub fn health(self: *Store) Error!store_health.Report {
+        if (!self.onDispatcher()) return self.invoke(Store.health, .{});
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var report = store_health.Report{ .previous_shutdown_clean = self.previous_shutdown_clean, .recovery = self.recovery };
+        report.schema_version = @intCast(try self.scalarU64("SELECT max(version) FROM spindle_schema_migration;"));
+        report.migration_hashes_valid = self.migrationHashesValid();
+        const quick_ok = try self.quickCheck();
+        report.history_gaps = try self.scalarU64("SELECT count(*) FROM workflow_instance i WHERE i.next_sequence<>COALESCE((SELECT max(h.sequence)+1 FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),1) OR (SELECT count(*) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id)<>COALESCE((SELECT max(h.sequence) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),0);");
+        report.snapshot_checksum_failures = try self.snapshotFailures();
+        report.orphan_records = try self.scalarU64("SELECT (SELECT count(*) FROM workflow_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+(SELECT count(*) FROM activity_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+(SELECT count(*) FROM durable_timer t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+(SELECT count(*) FROM outbox t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL);");
+        report.pending_work = try self.scalarU64("SELECT (SELECT count(*) FROM workflow_task WHERE status IN ('ready','claimed'))+(SELECT count(*) FROM activity_task WHERE status_v2 IN ('ready','claimed'))+(SELECT count(*) FROM durable_timer WHERE status_v2 IN ('ready','claimed'))+(SELECT count(*) FROM outbox WHERE status_v2 IN ('ready','claimed'));");
+        report.database_bytes = fileBytes(self.path);
+        var wal_path: [1024]u8 = undefined;
+        const wal = std.fmt.bufPrint(&wal_path, "{s}-wal", .{self.path}) catch return error.DatabaseFailure;
+        report.wal_bytes = fileBytes(wal);
+        report.last_checkpoint_utc_ms = @bitCast(try self.metadataU64("last_checkpoint_utc_ms"));
+        report.integrity = if (!quick_ok or !report.migration_hashes_valid or report.history_gaps != 0 or report.snapshot_checksum_failures != 0 or report.orphan_records != 0) .corrupt else if (self.recovery.workflow_tasks + self.recovery.activities + self.recovery.timers + self.recovery.outbox != 0) .repairable_queue_state else .healthy;
+        return report;
+    }
+
+    /// Uses SQLite's online backup API and validates the completed copy before returning.
+    pub fn backup(self: *Store, destination: []const u8) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.backup, .{destination});
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const zpath = self.allocator.dupeZ(u8, destination) catch return error.DatabaseFailure;
+        defer self.allocator.free(zpath);
+        var raw: ?*c.sqlite3 = null;
+        const open_result = c.sqlite3_open_v2(zpath.ptr, &raw, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX, null);
+        if (open_result != c.SQLITE_OK) {
+            if (raw) |handle| _ = c.sqlite3_close_v2(handle);
+            return map(open_result);
+        }
+        const target = raw orelse return error.DatabaseFailure;
+        var target_open = true;
+        defer {
+            if (target_open) _ = c.sqlite3_close_v2(target);
+        }
+        const handle = c.sqlite3_backup_init(target, "main", self.db, "main") orelse return map(c.sqlite3_errcode(target));
+        const result = c.sqlite3_backup_step(handle, -1);
+        const finish_result = c.sqlite3_backup_finish(handle);
+        if (result != c.SQLITE_DONE or finish_result != c.SQLITE_OK) return if (result == c.SQLITE_BUSY or result == c.SQLITE_LOCKED) error.BackupInterrupted else map(if (finish_result == c.SQLITE_OK) result else finish_result);
+        if (c.sqlite3_close_v2(target) != c.SQLITE_OK) return error.BackupInterrupted;
+        target_open = false;
+        if (!validateFile(self.allocator, destination)) return error.CorruptSchema;
+    }
+
+    /// Performs bounded maintenance on the store's blocking dispatcher, never a compute executor.
+    pub fn maintain(self: *Store, options: store_health.Maintenance) Error!store_health.MaintenanceProgress {
+        if (!self.onDispatcher()) return self.invoke(Store.maintain, .{options});
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var progress = store_health.MaintenanceProgress{};
+        if (cancelled(options)) return error.MaintenanceCancelled;
+        if (options.checkpoint) {
+            var log_frames: c_int = 0;
+            var checkpointed: c_int = 0;
+            const result = c.sqlite3_wal_checkpoint_v2(self.db, null, c.SQLITE_CHECKPOINT_PASSIVE, &log_frames, &checkpointed);
+            if (result != c.SQLITE_OK) return map(result);
+            try self.setMetadataU64("last_checkpoint_utc_ms", @bitCast(self.clock.utcNow()));
+            progress.checkpointed = true;
+            progress.wal_frames = @intCast(@max(log_frames, 0));
+            progress.checkpointed_frames = @intCast(@max(checkpointed, 0));
+        }
+        if (cancelled(options)) return error.MaintenanceCancelled;
+        if (options.incremental_vacuum_pages != 0) {
+            const before = try self.scalarU64("PRAGMA freelist_count;");
+            var sql: [64:0]u8 = undefined;
+            const query = std.fmt.bufPrintZ(&sql, "PRAGMA incremental_vacuum({d});", .{options.incremental_vacuum_pages}) catch return error.DatabaseFailure;
+            try self.exec(query.ptr);
+            const after = try self.scalarU64("PRAGMA freelist_count;");
+            progress.vacuumed_pages = @intCast(before -| after);
+        }
+        return progress;
+    }
+
+    /// Explicit offline restore. The source is validated, the old database is preserved as `.failed`, and reopening increments the epoch.
+    pub fn restoreOffline(allocator: std.mem.Allocator, path: []const u8, source: []const u8, clock: core.Clock) Error!Store {
+        if (!validateFile(allocator, source)) return error.CorruptSchema;
+        var failed: [1024:0]u8 = undefined;
+        const failed_path = std.fmt.bufPrintZ(&failed, "{s}.failed", .{path}) catch return error.RestoreFailed;
+        const io = std.Options.debug_io;
+        std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), failed_path, io) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.RestoreFailed,
+        };
+        std.Io.Dir.cwd().rename(source, std.Io.Dir.cwd(), path, io) catch {
+            std.Io.Dir.cwd().rename(failed_path, std.Io.Dir.cwd(), path, io) catch {};
+            return error.RestoreFailed;
+        };
+        var restored = try Store.init(allocator, path, clock);
+        errdefer restored.deinit();
+        const report = try restored.health();
+        if (report.integrity == .corrupt) return error.CorruptSchema;
+        return restored;
     }
 
     pub fn migrate(self: *Store) Error!void {
@@ -730,6 +851,50 @@ pub const Store = struct {
         try self.applyOneMigration(1, migration_sql);
         try self.applyOneMigration(2, migration_v2_sql);
     }
+    fn recoverClaims(self: *Store) Error!store_health.Recovery {
+        var recovery = store_health.Recovery{};
+        try self.exec("UPDATE workflow_task SET status='ready',claimed_epoch=NULL WHERE status='claimed' AND EXISTS(SELECT 1 FROM workflow_instance i WHERE i.tenant=workflow_task.tenant AND i.namespace=workflow_task.namespace AND i.workflow_id=workflow_task.workflow_id AND i.status='running');");
+        recovery.workflow_tasks = @intCast(c.sqlite3_changes(self.db));
+        try self.exec("UPDATE activity_task SET status_v2='ready',claimed_epoch=NULL WHERE status_v2='claimed';");
+        recovery.activities = @intCast(c.sqlite3_changes(self.db));
+        try self.exec("UPDATE durable_timer SET status_v2='ready',claimed_epoch=NULL WHERE status_v2='claimed';");
+        recovery.timers = @intCast(c.sqlite3_changes(self.db));
+        try self.exec("UPDATE outbox SET status_v2='ready',claimed_epoch=NULL WHERE status_v2='claimed';");
+        recovery.outbox = @intCast(c.sqlite3_changes(self.db));
+        return recovery;
+    }
+    fn scalarU64(self: *Store, sql: [*:0]const u8) Error!u64 {
+        const statement = try self.prepare(sql);
+        defer self.finalize(statement);
+        if (!try self.step(statement)) return 0;
+        return @intCast(self.columnInt(statement, 0));
+    }
+    fn migrationHashesValid(self: *Store) bool {
+        const first = self.migrationMatches(1, migration_sql) catch return false;
+        const second = self.migrationMatches(2, migration_v2_sql) catch return false;
+        return first and second;
+    }
+    fn migrationMatches(self: *Store, version: i64, sql: []const u8) Error!bool {
+        const statement = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=?1;");
+        defer self.finalize(statement);
+        try self.bindInt(statement, 1, version);
+        return try self.step(statement) and @as(u64, @bitCast(self.columnInt(statement, 0))) == core.hash.content(sql);
+    }
+    fn quickCheck(self: *Store) Error!bool {
+        const statement = try self.prepare("PRAGMA quick_check;");
+        defer self.finalize(statement);
+        return try self.step(statement) and std.mem.eql(u8, self.columnText(statement, 0), "ok");
+    }
+    fn snapshotFailures(self: *Store) Error!u64 {
+        const statement = try self.prepare("SELECT workflow_id,event_sequence,definition_version,state,checksum FROM workflow_snapshot;");
+        defer self.finalize(statement);
+        var failures: u64 = 0;
+        while (try self.step(statement)) {
+            const saved = snapshot.Snapshot{ .workflow_id = self.columnId(statement, 0), .event_sequence = @intCast(self.columnInt(statement, 1)), .definition_version = @intCast(self.columnInt(statement, 2)), .state = self.columnBlob(statement, 3), .checksum = @bitCast(self.columnInt(statement, 4)) };
+            if (!snapshot.verify(saved)) failures += 1;
+        }
+        return failures;
+    }
     fn applyOneMigration(self: *Store, version: i64, sql: []const u8) Error!void {
         const stmt = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=?1;");
         defer self.finalize(stmt);
@@ -847,10 +1012,94 @@ fn map(code: c_int) Error {
     return switch (code & 0xff) {
         c.SQLITE_BUSY, c.SQLITE_LOCKED => error.DatabaseBusy,
         c.SQLITE_FULL => error.DatabaseFull,
+        c.SQLITE_READONLY => error.DatabaseReadOnly,
         c.SQLITE_IOERR => error.DatabaseIo,
         c.SQLITE_CORRUPT, c.SQLITE_NOTADB, c.SQLITE_SCHEMA => error.CorruptSchema,
         else => error.DatabaseFailure,
     };
+}
+fn quickCheckDb(db: *c.sqlite3) bool {
+    var statement: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &statement, null) != c.SQLITE_OK) return false;
+    const value = statement orelse return false;
+    defer _ = c.sqlite3_finalize(value);
+    return c.sqlite3_step(value) == c.SQLITE_ROW and std.mem.eql(u8, c.sqlite3_column_text(value, 0)[0..@intCast(c.sqlite3_column_bytes(value, 0))], "ok");
+}
+fn validateDb(db: *c.sqlite3) bool {
+    if (!quickCheckDb(db)) return false;
+    if (!migrationDbMatches(db, 1, migration_sql) or !migrationDbMatches(db, 2, migration_v2_sql)) return false;
+    const invariant_failures = rawScalar(
+        db,
+        "SELECT " ++
+            "(SELECT count(*) FROM workflow_instance i WHERE i.next_sequence<>COALESCE((SELECT max(h.sequence)+1 FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),1) OR (SELECT count(*) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id)<>COALESCE((SELECT max(h.sequence) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),0))+" ++
+            "(SELECT count(*) FROM workflow_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+" ++
+            "(SELECT count(*) FROM activity_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+" ++
+            "(SELECT count(*) FROM durable_timer t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+" ++
+            "(SELECT count(*) FROM outbox t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL);",
+    ) orelse return false;
+    if (invariant_failures != 0) return false;
+    var statement: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT workflow_id,event_sequence,definition_version,state,checksum FROM workflow_snapshot;", -1, &statement, null) != c.SQLITE_OK) return false;
+    const rows = statement orelse return false;
+    defer _ = c.sqlite3_finalize(rows);
+    while (true) {
+        const result = c.sqlite3_step(rows);
+        if (result == c.SQLITE_DONE) return true;
+        if (result != c.SQLITE_ROW) return false;
+        const id_bytes = rawBlob(rows, 0);
+        if (id_bytes.len != 16) return false;
+        var id_array: [16]u8 = undefined;
+        @memcpy(&id_array, id_bytes);
+        const saved = snapshot.Snapshot{
+            .workflow_id = .fromBytes(id_array),
+            .event_sequence = @intCast(c.sqlite3_column_int64(rows, 1)),
+            .definition_version = @intCast(c.sqlite3_column_int64(rows, 2)),
+            .state = rawBlob(rows, 3),
+            .checksum = @bitCast(c.sqlite3_column_int64(rows, 4)),
+        };
+        if (!snapshot.verify(saved)) return false;
+    }
+}
+fn migrationDbMatches(db: *c.sqlite3, version: i64, sql: []const u8) bool {
+    var statement: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT checksum FROM spindle_schema_migration WHERE version=?1;", -1, &statement, null) != c.SQLITE_OK) return false;
+    const query = statement orelse return false;
+    defer _ = c.sqlite3_finalize(query);
+    if (c.sqlite3_bind_int64(query, 1, version) != c.SQLITE_OK) return false;
+    return c.sqlite3_step(query) == c.SQLITE_ROW and @as(u64, @bitCast(c.sqlite3_column_int64(query, 0))) == core.hash.content(sql);
+}
+fn rawScalar(db: *c.sqlite3, sql: [*:0]const u8) ?u64 {
+    var statement: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &statement, null) != c.SQLITE_OK) return null;
+    const query = statement orelse return null;
+    defer _ = c.sqlite3_finalize(query);
+    if (c.sqlite3_step(query) != c.SQLITE_ROW) return null;
+    return @intCast(c.sqlite3_column_int64(query, 0));
+}
+fn rawBlob(statement: *c.sqlite3_stmt, column: c_int) []const u8 {
+    const len: usize = @intCast(c.sqlite3_column_bytes(statement, column));
+    if (len == 0) return "";
+    const bytes: [*]const u8 = @ptrCast(c.sqlite3_column_blob(statement, column));
+    return bytes[0..len];
+}
+fn validateFile(allocator: std.mem.Allocator, path: []const u8) bool {
+    const zpath = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(zpath);
+    var raw: ?*c.sqlite3 = null;
+    if (c.sqlite3_open_v2(zpath.ptr, &raw, c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX, null) != c.SQLITE_OK) {
+        if (raw) |handle| _ = c.sqlite3_close_v2(handle);
+        return false;
+    }
+    const db = raw orelse return false;
+    defer _ = c.sqlite3_close_v2(db);
+    return validateDb(db);
+}
+fn cancelled(options: store_health.Maintenance) bool {
+    return if (options.cancelled) |check| check(options.cancellation_context) else false;
+}
+fn fileBytes(path: []const u8) u64 {
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch return 0;
+    return @intCast(stat.size);
 }
 fn initError(err: Error) Error {
     return if (err == error.DatabaseBusy) error.WorkflowStoreInUse else err;
