@@ -208,3 +208,138 @@ test "slab validates capacity, alignment, and double free" {
     try slab.release(item);
     try std.testing.expectError(error.DoubleFree, slab.release(item));
 }
+
+const TaskProbe = struct {
+    value: *std.atomic.Value(u32),
+    fn run(task: *spindle.executor.Task) void {
+        const self: *TaskProbe = @ptrCast(@alignCast(task.context.?));
+        _ = self.value.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "inline executor executes once and rejects duplicate submission" {
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var task = spindle.executor.Task.init(TaskProbe.run, &probe);
+    var executor: spindle.executor.InlineExecutor = .{};
+    try executor.submit(&task, .{});
+    try std.testing.expectEqual(@as(u32, 1), value.load(.acquire));
+    try std.testing.expectError(error.DuplicateSubmission, executor.submit(&task, .{}));
+    executor.shutdown(.drain);
+    var rejected = spindle.executor.Task.init(TaskProbe.run, &probe);
+    try std.testing.expectError(error.Shutdown, executor.submit(&rejected, .{}));
+}
+
+test "pump executor honors a task count drain budget" {
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 4);
+    defer pump.deinit();
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var first = spindle.executor.Task.init(TaskProbe.run, &probe);
+    var second = spindle.executor.Task.init(TaskProbe.run, &probe);
+    try pump.submit(&first, .{});
+    try pump.submit(&second, .{});
+    try std.testing.expectEqual(@as(usize, 1), pump.drain(1));
+    try std.testing.expectEqual(@as(u32, 1), value.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), pump.drain(1));
+    try std.testing.expectEqual(@as(u32, 2), value.load(.acquire));
+}
+
+test "fixed pool executes on a dedicated worker and joins on shutdown" {
+    var pool = try spindle.executor.FixedPool.init(std.testing.allocator, 1, 4);
+    defer pool.deinit();
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var task = spindle.executor.Task.init(TaskProbe.run, &probe);
+    try pool.submit(&task, .{});
+    try task.wait();
+    try std.testing.expectEqual(@as(u32, 1), value.load(.acquire));
+}
+
+test "frame arena refuses reuse while its epoch is in flight" {
+    var frames = spindle.executor.FrameArena.init(std.testing.allocator);
+    defer frames.deinit();
+    const in_flight = frames.counter();
+    in_flight.add(1);
+    try frames.rotate();
+    try frames.rotate();
+    try std.testing.expectError(error.FrameInFlight, frames.rotate());
+    in_flight.complete();
+    try frames.rotate();
+}
+
+const FailingTaskProbe = struct {
+    fn run(task: *spindle.executor.Task) void {
+        task.fail();
+    }
+};
+
+test "scope observes task failures and cancel-on-first-error joins children" {
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 4);
+    defer pump.deinit();
+    var scope = spindle.executor.Scope.init(pump.executor(), .cancel_on_first_error);
+    var failed = spindle.executor.Task.init(FailingTaskProbe.run, null);
+    var pending = spindle.executor.Task.init(FailingTaskProbe.run, null);
+    try scope.spawn(&failed);
+    try scope.spawn(&pending);
+    _ = pump.drain(1);
+    try std.testing.expectError(error.TaskFailed, scope.wait());
+    try std.testing.expectEqual(spindle.executor.TaskState.cancelled, pending.status());
+}
+
+test "executor registry rejects stale slot generations" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var inline_executor: spindle.executor.InlineExecutor = .{};
+    const id = try registry.register(inline_executor.executor());
+    try std.testing.expect(registry.resolve(id) != null);
+    try std.testing.expect(registry.unregister(id));
+    try std.testing.expect(registry.resolve(id) == null);
+}
+
+test "task handles become stale after terminal task reuse" {
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var task = spindle.executor.Task.init(TaskProbe.run, &probe);
+    var executor: spindle.executor.InlineExecutor = .{};
+    const handle = task.handle();
+    try executor.submit(&task, .{});
+    try task.reset();
+    try std.testing.expectError(error.StaleHandle, handle.status());
+    try std.testing.expect(!handle.cancel());
+}
+
+test "tracked detached work is cancelled and joined by its explicit owner" {
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 2);
+    defer pump.deinit();
+    var tracker = spindle.executor.DetachedTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var handle = try spindle.executor.submitTrackedDetached(&tracker, std.testing.allocator, pump.executor(), TaskProbe.run, &probe);
+    tracker.shutdown();
+    pump.shutdown(.cancel_pending);
+    try handle.wait();
+    try std.testing.expectEqual(spindle.executor.TaskState.cancelled, try handle.taskHandle().status());
+    handle.deinit();
+}
+
+const WorkerIdentityProbe = struct {
+    pool: *spindle.executor.FixedPool,
+    observed: *std.atomic.Value(bool),
+    fn run(task: *spindle.executor.Task) void {
+        const self: *WorkerIdentityProbe = @ptrCast(@alignCast(task.context.?));
+        self.observed.store(self.pool.isWorkerThread(), .release);
+    }
+};
+
+test "fixed pool identifies its own worker thread" {
+    var pool = try spindle.executor.FixedPool.init(std.testing.allocator, 1, 2);
+    defer pool.deinit();
+    var observed: std.atomic.Value(bool) = .init(false);
+    var probe = WorkerIdentityProbe{ .pool = &pool, .observed = &observed };
+    var task = spindle.executor.Task.init(WorkerIdentityProbe.run, &probe);
+    try pool.submit(&task, .{});
+    try task.wait();
+    try std.testing.expect(observed.load(.acquire));
+}
