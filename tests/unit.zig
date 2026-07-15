@@ -1,5 +1,102 @@
 const std = @import("std");
 const spindle = @import("spindle");
+const login_workflow = @import("fixtures/login_workflow.zig");
+
+test "workflow login v3 fixture replays normal reconnect timeout and compensation commands" {
+    const workflow = spindle.workflow;
+    const Event = workflow.event.Event;
+    const Payload = workflow.event.Payload;
+    const commands = workflow.command.Command;
+    const empty = Payload{ .schema = login_workflow.event_schema, .bytes = "" };
+    const history = [_]Event{
+        .{ .sequence = 1, .kind = workflow.event.Kind.started, .utc_ms = 100, .payload = empty },
+        .{ .sequence = 2, .kind = workflow.event.Kind.activity_completed, .utc_ms = 101, .payload = empty },
+    };
+    const recorded = [_]workflow.replay.CommandEvent{
+        .{ .input_sequence = 1, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.schedule_activity, .payload = .{ .schema = login_workflow.command_schema, .bytes = "authenticate" } }} },
+        .{ .input_sequence = 2, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.complete, .payload = .{ .schema = login_workflow.command_schema, .bytes = "logged-in" } }} },
+    };
+    var storage: [4]commands = undefined;
+    const result = try workflow.replay.verify(login_workflow.definition, login_workflow.idle, null, &history, &recorded, &storage, &.{});
+    try std.testing.expectEqual(workflow.instance.Status.completed, result.status);
+    var second_storage: [4]commands = undefined;
+    const replayed = try workflow.replay.verify(login_workflow.definition, login_workflow.idle, null, &history, &recorded, &second_storage, &.{});
+    try std.testing.expectEqual(result, replayed);
+
+    const reconnect_history = [_]Event{
+        .{ .sequence = 1, .kind = workflow.event.Kind.started, .utc_ms = 100, .payload = empty },
+        .{ .sequence = 2, .kind = workflow.event.Kind.signal_received, .utc_ms = 101, .payload = empty },
+        .{ .sequence = 3, .kind = workflow.event.Kind.activity_completed, .utc_ms = 102, .payload = empty },
+    };
+    const reconnected = [_]workflow.replay.CommandEvent{
+        recorded[0],
+        .{ .input_sequence = 2, .commands = &.{} },
+        .{ .input_sequence = 3, .commands = recorded[1].commands },
+    };
+    try std.testing.expectEqual(workflow.instance.Status.completed, (try workflow.replay.verify(login_workflow.definition, login_workflow.idle, null, &reconnect_history, &reconnected, &storage, &.{})).status);
+
+    const failure_history = [_]Event{
+        .{ .sequence = 1, .kind = workflow.event.Kind.started, .utc_ms = 100, .payload = empty },
+        .{ .sequence = 2, .kind = workflow.event.Kind.activity_failed, .utc_ms = 102, .payload = empty },
+    };
+    const failed = [_]workflow.replay.CommandEvent{
+        recorded[0],
+        .{ .input_sequence = 2, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.compensate, .payload = .{ .schema = login_workflow.command_schema, .bytes = "revoke-session" } }} },
+    };
+    try std.testing.expectEqual(workflow.instance.Status.failed, (try workflow.replay.verify(login_workflow.definition, login_workflow.idle, null, &failure_history, &failed, &storage, &.{})).status);
+}
+
+test "workflow verifier detects command mutation and retry is deterministic" {
+    const workflow = spindle.workflow;
+    const Event = workflow.event.Event;
+    const Payload = workflow.event.Payload;
+    const Command = workflow.command.Command;
+    const history = [_]Event{.{ .sequence = 1, .kind = workflow.event.Kind.started, .utc_ms = 0, .payload = Payload{ .schema = login_workflow.event_schema, .bytes = "" } }};
+    const mutated = [_]workflow.replay.CommandEvent{.{ .input_sequence = 1, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.complete, .payload = .{ .schema = login_workflow.command_schema, .bytes = "wrong" } }} }};
+    var storage: [2]Command = undefined;
+    try std.testing.expectError(error.CommandMismatch, workflow.replay.verify(login_workflow.definition, login_workflow.idle, null, &history, &mutated, &storage, &.{}));
+    const policy = workflow.retry.Policy{ .initial_backoff_ms = 10, .max_backoff_ms = 25, .max_attempts = 3, .jitter_percent = 20, .non_retryable = &.{9} };
+    try std.testing.expectEqual(workflow.retry.delayMs(policy, 3, 17), workflow.retry.delayMs(policy, 3, 17));
+    try std.testing.expect(!workflow.retry.shouldRetry(policy, 1, .{ .kind = .application, .code = 9, .message = "permanent" }));
+}
+
+test "workflow registry snapshots migrations and instance state transitions are explicit" {
+    const workflow = spindle.workflow;
+    var registry = workflow.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.register(login_workflow.definition);
+    try std.testing.expectError(error.DuplicateVersion, registry.register(login_workflow.definition));
+    registry.freeze();
+    try std.testing.expectError(error.Frozen, registry.register(login_workflow.definition));
+    try std.testing.expectError(error.UnknownVersion, registry.find(login_workflow.definition_id, 99));
+
+    const id = spindle.core.StableId{ .high = 1, .low = 2 };
+    const saved = workflow.snapshot.Snapshot{ .workflow_id = id, .event_sequence = 7, .definition_version = 3, .state = "waiting", .checksum = workflow.snapshot.checksum(id, 7, 3, "waiting") };
+    try std.testing.expect(workflow.snapshot.verify(saved));
+    const header = workflow.snapshot.encodeHeader(saved);
+    try std.testing.expectEqual(@as(u8, 0), header[0]);
+    try std.testing.expectEqual(@as(u8, 2), header[15]);
+    try std.testing.expect(!workflow.snapshot.verify(.{ .workflow_id = id, .event_sequence = 7, .definition_version = 3, .state = "changed", .checksum = saved.checksum }));
+
+    const step = struct {
+        fn apply(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+            const value = try allocator.alloc(u8, input.len + 1);
+            @memcpy(value[0..input.len], input);
+            value[input.len] = '!';
+            return value;
+        }
+    }.apply;
+    const migrated = try workflow.migration.migrate(std.testing.allocator, &.{.{ .from_version = 2, .to_version = 3, .apply = step }}, 2, 3, "state");
+    defer std.testing.allocator.free(migrated);
+    try std.testing.expectEqualStrings("state!", migrated);
+    try std.testing.expectError(error.MigrationGap, workflow.migration.migrate(std.testing.allocator, &.{}, 2, 3, "state"));
+
+    var value = workflow.instance.Instance{ .id = id, .definition_id = login_workflow.definition_id, .definition_version = 3, .created_utc_ms = 1, .updated_utc_ms = 1 };
+    try std.testing.expectError(error.InvalidSequence, value.applySequence(2, 2));
+    try value.applySequence(1, 2);
+    try value.finish(.completed, 3);
+    try std.testing.expectError(error.TerminalInstance, value.applySequence(2, 4));
+}
 
 test "public package imports without initialization" {
     try std.testing.expect(@TypeOf(spindle) == type);
