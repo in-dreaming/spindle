@@ -26,6 +26,7 @@ pub const ComponentRegistry = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayListUnmanaged(ComponentMeta) = .empty,
     frozen: bool = false,
+    version: u64 = 0,
     pub fn init(allocator: std.mem.Allocator) ComponentRegistry {
         return .{ .allocator = allocator };
     }
@@ -48,6 +49,7 @@ pub const ComponentRegistry = struct {
             if (std.mem.eql(u8, entry.name, meta.name)) return error.DuplicateName;
         }
         try self.entries.append(self.allocator, meta);
+        self.version +%= 1;
     }
     /// Registers T using an explicit stable name. The default lifecycle is bytewise copy and no destruction.
     pub fn registerType(self: *ComponentRegistry, comptime T: type, name: []const u8, schema_version: u32, flags: ComponentFlags) (Error || std.mem.Allocator.Error)!ComponentTypeId {

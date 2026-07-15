@@ -753,3 +753,106 @@ test "compiled local task graph has independent concurrent execution state" {
     try second.wait();
     try std.testing.expectEqual(@as(u32, 6), value.load(.acquire));
 }
+
+const EcsPosition = struct { x: i32 };
+const EcsVelocity = struct { x: i32 };
+
+test "ecs query plans refresh incrementally and enforce declared writes" {
+    var world = try spindle.ecs.World.init(std.testing.allocator, .{});
+    defer world.deinit();
+    const position = try world.registerComponent(EcsPosition, "test.query.position");
+    const velocity = try world.registerComponent(EcsVelocity, "test.query.velocity");
+    const first = try world.create();
+    try world.add(first, position, EcsPosition{ .x = 2 });
+    var plan = try spindle.ecs.QueryPlan.init(std.testing.allocator, &world, .{ .required = &.{position}, .write = &.{position} });
+    defer plan.deinit();
+    var iterator = try plan.iterator(&world);
+    var view = iterator.next().?;
+    const positions = try view.write(position, EcsPosition);
+    positions[0].x = 7;
+    try std.testing.expectError(error.UndeclaredWrite, view.write(velocity, EcsVelocity));
+    try std.testing.expectError(error.ActiveChunkBorrow, world.create());
+    view.deinit();
+    const second = try world.create();
+    try world.add(second, position, EcsPosition{ .x = 4 });
+    try world.add(second, velocity, EcsVelocity{ .x = 9 });
+    iterator = try plan.iterator(&world);
+    var count: usize = 0;
+    while (iterator.next()) |value| {
+        var chunk = value;
+        count += chunk.entities().len;
+        chunk.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "ecs deferred commands resolve temporary entities and merge deterministically" {
+    var world = try spindle.ecs.World.init(std.testing.allocator, .{});
+    defer world.deinit();
+    const position = try world.registerComponent(EcsPosition, "test.command.position");
+    var queue = spindle.ecs.CommandQueue.init(std.testing.allocator);
+    var first = queue.buffer();
+    defer first.deinit();
+    const temp = try first.create();
+    try first.add(temp, position, EcsPosition{ .x = 1 });
+    try first.set(temp, position, EcsPosition{ .x = 5 });
+    var buffers = [_]@TypeOf(first){first};
+    try queue.apply(&world, &buffers);
+    try std.testing.expectEqual(@as(usize, 1), world.entities.slots.items.len);
+    const entity = world.archetypes.items[1].chunks.items[0].entities()[0];
+    try std.testing.expectEqual(@as(i32, 5), (try world.get(entity, position, EcsPosition)).x);
+}
+
+test "ecs deferred destroy has deterministic batch precedence" {
+    var world = try spindle.ecs.World.init(std.testing.allocator, .{});
+    defer world.deinit();
+    const position = try world.registerComponent(EcsPosition, "test.command.destroy-position");
+    const value = try world.create();
+    try world.add(value, position, EcsPosition{ .x = 1 });
+    var queue = spindle.ecs.CommandQueue.init(std.testing.allocator);
+    var buffer = queue.buffer();
+    defer buffer.deinit();
+    try buffer.set(.{ .entity = value }, position, EcsPosition{ .x = 9 });
+    try buffer.destroy(.{ .entity = value });
+    try buffer.add(.{ .entity = value }, position, EcsPosition{ .x = 17 });
+    var buffers = [_]@TypeOf(buffer){buffer};
+    try queue.apply(&world, &buffers);
+    try std.testing.expect(!world.isAlive(value));
+}
+
+test "ecs command preflight OOM leaves the world unchanged" {
+    var world = try spindle.ecs.World.init(std.testing.allocator, .{});
+    defer world.deinit();
+    const position = try world.registerComponent(EcsPosition, "test.command.preflight-oom-position");
+    const value = try world.create();
+    try world.add(value, position, EcsPosition{ .x = 3 });
+    var queue = spindle.ecs.CommandQueue.init(std.testing.allocator);
+    var buffer = queue.buffer();
+    defer buffer.deinit();
+    try buffer.add(.{ .entity = value }, position, EcsPosition{ .x = 12 });
+    var buffers = [_]@TypeOf(buffer){buffer};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    world.allocator = failing.allocator();
+    world.entities.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, queue.apply(&world, &buffers));
+    world.allocator = std.testing.allocator;
+    world.entities.allocator = std.testing.allocator;
+    try std.testing.expect(world.isAlive(value));
+    try std.testing.expectEqual(@as(i32, 3), (try world.get(value, position, EcsPosition)).x);
+}
+
+test "ecs frame events merge by global sequence and expire at frame advance" {
+    var events = spindle.ecs.event.FrameEvent(u32).init(std.testing.allocator);
+    defer events.deinit();
+    var left = events.buffer();
+    defer left.deinit();
+    var right = events.buffer();
+    defer right.deinit();
+    try left.emit(1);
+    try right.emit(2);
+    var buffers = [_]@TypeOf(left){ left, right };
+    try events.merge(&buffers);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, events.events());
+    events.advance();
+    try std.testing.expectEqual(@as(usize, 0), events.events().len);
+}

@@ -1,8 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const entity = @import("entity.zig");
 const registry = @import("component_registry.zig");
 const signature = @import("signature.zig");
 const archetype = @import("archetype.zig");
+const chunk_mod = @import("chunk.zig");
 
 /// Single-threaded archetype ECS storage. Returned component borrows are invalidated by any structural change.
 pub const World = struct {
@@ -13,6 +15,7 @@ pub const World = struct {
     chunk_bytes: usize,
     archetype_version: u64 = 0,
     change_tick: u32 = 1,
+    active_chunk_borrows: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: struct { chunk_bytes: usize = 2048 }) !World {
         var result: World = .{ .allocator = allocator, .registry = registry.ComponentRegistry.init(allocator), .entities = entity.EntityStore.init(allocator), .chunk_bytes = @max(options.chunk_bytes, 2048) };
@@ -40,6 +43,7 @@ pub const World = struct {
     }
     /// Allocates an entity in the empty archetype.
     pub fn create(self: *World) !entity.Entity {
+        try self.ensureNoChunkBorrows();
         self.registry.freeze();
         const value = try self.entities.create();
         errdefer {
@@ -60,13 +64,23 @@ pub const World = struct {
     }
     /// Adds a component and migrates the entity to a new archetype. On allocation or lifecycle failure the old entity remains usable.
     pub fn add(self: *World, value: entity.Entity, id: registry.ComponentTypeId, component: anytype) !void {
+        try self.ensureNoChunkBorrows();
         if (self.has(value, id)) return error.AlreadyHasComponent;
         const meta = self.registry.find(id) orelse return error.UnknownComponent;
         if (@sizeOf(@TypeOf(component)) != meta.size) return error.ComponentSizeMismatch;
         try self.migrate(value, id, true, &component);
     }
+    /// Dynamic component insertion used by deferred command buffers. `bytes` must exactly match the registered component size.
+    pub fn addRaw(self: *World, value: entity.Entity, id: registry.ComponentTypeId, bytes: []const u8) !void {
+        try self.ensureNoChunkBorrows();
+        if (self.has(value, id)) return error.AlreadyHasComponent;
+        const meta = self.registry.find(id) orelse return error.UnknownComponent;
+        if (bytes.len != meta.size) return error.ComponentSizeMismatch;
+        try self.migrate(value, id, true, @ptrCast(bytes.ptr));
+    }
     /// Removes a component, retaining every other component value.
     pub fn remove(self: *World, value: entity.Entity, id: registry.ComponentTypeId) !void {
+        try self.ensureNoChunkBorrows();
         if (!self.has(value, id)) return error.MissingComponent;
         try self.migrate(value, id, false, null);
     }
@@ -74,6 +88,16 @@ pub const World = struct {
     pub fn set(self: *World, value: entity.Entity, id: registry.ComponentTypeId, component: anytype) !void {
         const ptr = try self.getMut(value, id, @TypeOf(component));
         ptr.* = component;
+    }
+    /// Dynamic replacement used by deferred command buffers.
+    pub fn setRaw(self: *World, value: entity.Entity, id: registry.ComponentTypeId, bytes: []const u8) !void {
+        const location = self.entities.location(value) orelse return error.StaleEntity;
+        const meta = self.registry.find(id) orelse return error.UnknownComponent;
+        if (bytes.len != meta.size) return error.ComponentSizeMismatch;
+        var target = &self.archetypes.items[location.archetype].chunks.items[location.chunk];
+        const raw = target.valuePtr(id, location.row) orelse return error.MissingComponent;
+        @memcpy(@as([*]u8, @ptrCast(raw))[0..bytes.len], bytes);
+        target.markChanged(id, self.change_tick);
     }
     pub fn get(self: *const World, value: entity.Entity, id: registry.ComponentTypeId, comptime T: type) !*const T {
         const location = self.entities.location(value) orelse return error.StaleEntity;
@@ -90,6 +114,7 @@ pub const World = struct {
     }
     /// Destroys an entity and invokes component destruction exactly once.
     pub fn destroy(self: *World, value: entity.Entity) !void {
+        try self.ensureNoChunkBorrows();
         const location = self.entities.location(value) orelse return error.StaleEntity;
         const arch = &self.archetypes.items[location.archetype];
         for (arch.signature.ids.items) |id| {
@@ -102,7 +127,7 @@ pub const World = struct {
     fn metasFor(self: *const World, sig: *const signature.Signature, allocator: std.mem.Allocator) ![]registry.ComponentMeta {
         const values = try allocator.alloc(registry.ComponentMeta, sig.ids.items.len);
         errdefer allocator.free(values);
-        for (sig.ids.items, 0..) |id, i| values[i] = self.registry.find(id) orelse return error.UnknownComponent;
+        for (sig.ids.items, 0..) |id, i| values[i] = (self.registry.find(id) orelse return error.UnknownComponent).*;
         return values;
     }
     /// Consumes `sig`, leaving it empty in every return path.
@@ -128,9 +153,18 @@ pub const World = struct {
         } else {
             try self.archetypes.items[old_location.archetype].remove_edges.put(self.allocator, changing_id, target_index);
         }
-        const metas = try self.metasFor(&self.archetypes.items[target_index].signature, self.allocator);
-        defer self.allocator.free(metas);
-        const destination = try self.archetypes.items[target_index].allocateRow(metas, self.chunk_bytes);
+        var has_free_row = false;
+        for (self.archetypes.items[target_index].chunks.items) |item| if (item.count < item.capacity) {
+            has_free_row = true;
+            break;
+        };
+        const destination = if (has_free_row)
+            try self.archetypes.items[target_index].allocateRow(&.{}, self.chunk_bytes)
+        else blk: {
+            const metas = try self.metasFor(&self.archetypes.items[target_index].signature, self.allocator);
+            defer self.allocator.free(metas);
+            break :blk try self.archetypes.items[target_index].allocateRow(metas, self.chunk_bytes);
+        };
         var initialized: usize = 0;
         errdefer {
             const target_chunk = &self.archetypes.items[target_index].chunks.items[destination.chunk_index];
@@ -170,6 +204,45 @@ pub const World = struct {
             self.entities.setLocation(moved, .{ .archetype = location.archetype, .chunk = location.chunk, .row = location.row });
         }
         chunk.count -= 1;
+    }
+    /// Advances the wrapping change clock once per frame. Change comparisons are valid for cursors less than half the u32 range apart.
+    pub fn advanceChangeTick(self: *World) u32 {
+        self.change_tick +%= 1;
+        return self.change_tick;
+    }
+    /// Prepares storage for a deferred structural batch. It may create empty archetypes, but never creates entities.
+    pub fn reserveStructural(self: *World, sig: *const signature.Signature, rows: usize, create_count: usize, edge_count: usize) !void {
+        try self.ensureNoChunkBorrows();
+        try self.entities.reserveAdditional(create_count);
+        const edge_capacity: u32 = std.math.cast(u32, edge_count) orelse return error.TooManyCommands;
+        for (self.archetypes.items) |*item| {
+            try item.add_edges.ensureTotalCapacity(self.allocator, edge_capacity);
+            try item.remove_edges.ensureTotalCapacity(self.allocator, edge_capacity);
+        }
+        const index = try self.findOrCreateArchetypeClone(sig);
+        const metas = try self.metasFor(&self.archetypes.items[index].signature, self.allocator);
+        defer self.allocator.free(metas);
+        var free_rows: usize = 0;
+        for (self.archetypes.items[index].chunks.items) |item| free_rows += item.capacity - item.count;
+        while (free_rows < rows) {
+            const fresh = try chunk_mod.Chunk.init(self.allocator, metas, self.chunk_bytes);
+            free_rows += fresh.capacity;
+            try self.archetypes.items[index].chunks.append(self.allocator, fresh);
+        }
+    }
+    fn findOrCreateArchetypeClone(self: *World, sig: *const signature.Signature) !usize {
+        var copy = try sig.clone(self.allocator);
+        return self.findOrCreateArchetype(&copy);
+    }
+    pub fn beginChunkBorrow(self: *World) void {
+        self.active_chunk_borrows += 1;
+    }
+    pub fn endChunkBorrow(self: *World) void {
+        std.debug.assert(self.active_chunk_borrows > 0);
+        self.active_chunk_borrows -= 1;
+    }
+    fn ensureNoChunkBorrows(self: *const World) error{ActiveChunkBorrow}!void {
+        if (builtin.mode == .Debug and self.active_chunk_borrows != 0) return error.ActiveChunkBorrow;
     }
 };
 

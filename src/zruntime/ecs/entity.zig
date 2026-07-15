@@ -32,6 +32,10 @@ pub const EntityStore = struct {
         try self.slots.append(self.allocator, .{});
         return .{ .index = index, .generation = 1 };
     }
+    /// Reserves slots before a transactional structural batch begins.
+    pub fn reserveAdditional(self: *EntityStore, count: usize) !void {
+        try self.slots.ensureUnusedCapacity(self.allocator, count);
+    }
     pub fn valid(self: *const EntityStore, entity: Entity) bool {
         return entity.index < self.slots.items.len and self.slots.items[entity.index].generation == entity.generation and self.slots.items[entity.index].location != null;
     }

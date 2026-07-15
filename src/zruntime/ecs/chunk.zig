@@ -43,7 +43,7 @@ pub const Chunk = struct {
         const ptr: [*]entity.Entity = @ptrCast(@alignCast(self.storage.ptr + self.entity_offset));
         return ptr[0..self.capacity];
     }
-    pub fn column(self: *Chunk, id: registry.ComponentTypeId) ?Column {
+    pub fn column(self: *const Chunk, id: registry.ComponentTypeId) ?Column {
         for (self.columns.items) |entry| if (entry.id == id) return entry;
         return null;
     }
