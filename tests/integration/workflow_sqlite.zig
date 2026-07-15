@@ -47,6 +47,10 @@ const Ids = struct {
     }
 };
 
+fn denySchema(_: ?*anyopaque, _: []const u8, _: []const u8, _: spindle.core.schema.SchemaKey) bool {
+    return false;
+}
+
 const BusinessActivity = struct {
     const path = ".zig-cache/workflow-activity-business.db";
     var calls: std.atomic.Value(u32) = .init(0);
@@ -725,7 +729,7 @@ test "store health reports deterministic claim recovery and clean shutdown state
     defer reopened.deinit();
     const report = try reopened.health();
     try std.testing.expect(report.previous_shutdown_clean);
-    try std.testing.expectEqual(@as(u32, 3), report.schema_version);
+    try std.testing.expectEqual(@as(u32, 4), report.schema_version);
     try std.testing.expect(report.migration_hashes_valid);
     try std.testing.expectEqual(@as(u64, 1), report.recovery.workflow_tasks);
     try std.testing.expectEqual(spindle.workflow.store_health.Integrity.repairable_queue_state, report.integrity);
@@ -775,4 +779,65 @@ test "health classifies checksum corruption and maintenance cancellation" {
     const report = try reopened.health();
     try std.testing.expectEqual(@as(u64, 1), report.snapshot_checksum_failures);
     try std.testing.expectEqual(spindle.workflow.store_health.Integrity.corrupt, report.integrity);
+}
+
+fn migrationSuffix(allocator: std.mem.Allocator, state: []const u8) ![]u8 {
+    const result = try allocator.alloc(u8, state.len + 1);
+    @memcpy(result[0..state.len], state);
+    result[state.len] = '!';
+    return result;
+}
+
+test "definition migration and audited termination are atomic and idempotent" {
+    const file = ".zig-cache/workflow-task21.db";
+    cleanup(file);
+    defer cleanup(file);
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 2100);
+    var ids: Ids = .{};
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    defer store.deinit();
+    const client = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    const workflow_id = try client.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "migrate" }, .tenant = "operator", .namespace = "test", .idempotency_key = "start", .utc_ms = 2100 });
+    const schema_denied = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next }, .schema_allowed = denySchema };
+    try std.testing.expectError(error.SchemaNotAllowed, schema_denied.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "denied" }, .tenant = "operator", .namespace = "test", .idempotency_key = "schema", .utc_ms = 2100 }));
+    const quota_denied = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next }, .max_workflows_per_namespace = 1 };
+    try std.testing.expectError(error.QuotaExceeded, quota_denied.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "quota" }, .tenant = "operator", .namespace = "test", .idempotency_key = "quota", .utc_ms = 2100 }));
+    const stale_claim = (try store.claimWorkflowTask("operator", "test")).?;
+    const admin = spindle.workflow.operator.Client{ .store = &store, .principal = .{ .name = "admin", .tenant = "operator", .namespace = "test", .role = .admin }, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    try admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "upgrade", .idempotency_key = "migrate" }, .target_version = 4, .target_hash = 0x55, .steps = &.{.{ .from_version = 3, .to_version = 4, .apply = migrationSuffix }} });
+    const migrated = try store.getInstance("operator", "test", workflow_id);
+    defer std.testing.allocator.free(migrated.state);
+    try std.testing.expectEqual(@as(u32, 4), migrated.definition_version);
+    try std.testing.expectEqualStrings("!", migrated.state);
+    try std.testing.expectError(error.Conflict, store.commitWorkflowTaskTransition(.{ .claim = stale_claim, .tenant = "operator", .namespace = "test", .state = "stale", .status = .running, .last_processed_sequence = 1, .updated_utc_ms = 2100 }));
+    try std.testing.expectError(error.MigrationFailed, admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "broken", .idempotency_key = "broken" }, .target_version = 5, .target_hash = 0x66, .steps = &.{} }));
+    const after_failure = try store.getInstance("operator", "test", workflow_id);
+    defer std.testing.allocator.free(after_failure.state);
+    try std.testing.expectEqual(@as(u32, 4), after_failure.definition_version);
+    try client.signal(.{ .workflow_id = workflow_id, .signal_name = "after-migrate", .payload = .{ .schema = login.event_schema, .bytes = "ordered" }, .message_id = Ids.next(&ids), .tenant = "operator", .namespace = "test", .utc_ms = 2100 });
+    const viewer = spindle.workflow.operator.Client{ .store = &store, .principal = .{ .name = "viewer", .tenant = "operator", .namespace = "test", .role = .viewer }, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    try std.testing.expectError(error.Unauthorized, viewer.terminate(.{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "no permission", .idempotency_key = "deny" }));
+    try std.testing.expectError(error.Unauthorized, viewer.cancel(.{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "no permission", .idempotency_key = "deny-cancel" }));
+    try std.testing.expectError(error.Unauthorized, viewer.retry(.{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "no permission", .idempotency_key = "deny-retry" }));
+    try std.testing.expectError(error.Unauthorized, viewer.inspect("other", "test", workflow_id));
+    const operator_client = spindle.workflow.operator.Client{ .store = &store, .principal = .{ .name = "operator", .tenant = "operator", .namespace = "test", .role = .operator }, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    try std.testing.expectError(error.Unauthorized, operator_client.terminate(.{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "admin only", .idempotency_key = "operator-deny" }));
+    const active = try store.getInstance("operator", "test", workflow_id);
+    defer std.testing.allocator.free(active.state);
+    try std.testing.expectEqual(spindle.workflow.instance.Status.running, active.status);
+    const terminate = spindle.workflow.operator.Mutation{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "operator request", .idempotency_key = "terminate" };
+    try admin.terminate(terminate);
+    try admin.terminate(terminate);
+    const terminated = try store.getInstance("operator", "test", workflow_id);
+    defer std.testing.allocator.free(terminated.state);
+    try std.testing.expectEqual(spindle.workflow.instance.Status.cancelled, terminated.status);
+    const history = try store.readHistory(std.testing.allocator, "operator", "test", workflow_id);
+    defer {
+        for (history) |record| std.testing.allocator.free(record.payload);
+        std.testing.allocator.free(history);
+    }
+    try std.testing.expectEqual(spindle.workflow.event.Kind.definition_migrated, history[1].kind);
+    try std.testing.expectEqual(spindle.workflow.event.Kind.signal_received, history[2].kind);
+    try std.testing.expectEqual(spindle.workflow.event.Kind.workflow_terminated, history[3].kind);
+    try std.testing.expectEqual(@as(u64, 7), try store.auditCount("operator", "test"));
 }

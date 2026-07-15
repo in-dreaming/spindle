@@ -6,7 +6,8 @@ const sqlite = @import("sqlite.zig");
 
 pub const Action = enum { start, signal, cancel, get_instance };
 pub const AuthHook = *const fn (?*anyopaque, []const u8, []const u8, Action, ?core.StableId) bool;
-pub const Error = error{ Unauthorized, IdempotencyConflict, NotFound, DatabaseFailure, PayloadTooLarge };
+pub const SchemaHook = *const fn (?*anyopaque, []const u8, []const u8, core.schema.SchemaKey) bool;
+pub const Error = error{ Unauthorized, IdempotencyConflict, NotFound, DatabaseFailure, PayloadTooLarge, QuotaExceeded, SchemaNotAllowed };
 pub const IdSource = struct {
     context: *anyopaque,
     next_fn: *const fn (*anyopaque) core.StableId,
@@ -24,8 +25,14 @@ pub const Client = struct {
     auth_context: ?*anyopaque,
     auth: AuthHook,
     ids: IdSource,
+    schema_context: ?*anyopaque = null,
+    schema_allowed: SchemaHook = allowSchema,
+    max_workflows_per_namespace: u64 = 100_000,
     pub fn start(self: Client, r: StartRequest) Error!core.StableId {
         if (!self.auth(self.auth_context, r.tenant, r.namespace, .start, null)) return error.Unauthorized;
+        if (!self.schema_allowed(self.schema_context, r.tenant, r.namespace, r.input.schema)) return error.SchemaNotAllowed;
+        const instance_count = self.store.instanceCount(r.tenant, r.namespace) catch return error.DatabaseFailure;
+        if (instance_count >= self.max_workflows_per_namespace) return error.QuotaExceeded;
         const utc_ms = self.store.clock.utcNow();
         return self.store.start(.{ .workflow_id = self.ids.next(), .task_id = self.ids.next(), .event_id = self.ids.next(), .tenant = r.tenant, .namespace = r.namespace, .idempotency_key = r.idempotency_key, .request_hash = @bitCast(hash(r)), .definition_id = r.definition.id, .definition_version = r.definition.version, .schema = r.input.schema, .payload = r.input.bytes, .utc_ms = utc_ms }) catch |e| switch (e) {
             error.IdempotencyConflict => error.IdempotencyConflict,
@@ -35,6 +42,7 @@ pub const Client = struct {
     }
     pub fn signal(self: Client, r: SignalRequest) Error!void {
         if (!self.auth(self.auth_context, r.tenant, r.namespace, .signal, r.workflow_id)) return error.Unauthorized;
+        if (!self.schema_allowed(self.schema_context, r.tenant, r.namespace, r.payload.schema)) return error.SchemaNotAllowed;
         const utc_ms = self.store.clock.utcNow();
         return self.store.appendInbox(.{ .task_id = self.ids.next(), .event_id = self.ids.next(), .message_id = r.message_id, .workflow_id = r.workflow_id, .tenant = r.tenant, .namespace = r.namespace, .kind = event.Kind.signal_received, .schema = r.payload.schema, .payload = r.payload.bytes, .utc_ms = utc_ms }) catch |e| switch (e) {
             error.PayloadTooLarge => error.PayloadTooLarge,
@@ -76,4 +84,7 @@ pub fn allowAll(_: ?*anyopaque, _: []const u8, _: []const u8, _: Action, _: ?cor
 }
 pub fn denyAll(_: ?*anyopaque, _: []const u8, _: []const u8, _: Action, _: ?core.StableId) bool {
     return false;
+}
+pub fn allowSchema(_: ?*anyopaque, _: []const u8, _: []const u8, _: core.schema.SchemaKey) bool {
+    return true;
 }

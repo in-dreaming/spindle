@@ -147,6 +147,19 @@ test "workflow registry snapshots migrations and instance state transitions are 
     try std.testing.expectError(error.TerminalInstance, value.applySequence(2, 4));
 }
 
+test "workflow operator event schemas and payloads match golden bytes" {
+    const event = spindle.workflow.event;
+    try std.testing.expectEqual(@as(u32, 20), event.Kind.definition_migrated);
+    try std.testing.expectEqual(@as(u32, 14), event.Kind.workflow_terminated);
+    try std.testing.expectEqual(@as(u64, 0x6465_666d_6967_7261), event.definition_migrated_schema.id);
+    var migration_bytes: [64]u8 = undefined;
+    const migrated = try event.encodeDefinitionMigratedBytes(&migration_bytes, .{ .version = 4, .hash = 0x0102_0304_0506_0708, .principal = "op", .reason = "why" });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 4, 1, 2, 3, 4, 5, 6, 7, 8, 0, 2, 0, 3, 'o', 'p', 'w', 'h', 'y' }, migrated);
+    var terminated_bytes: [32]u8 = undefined;
+    const terminated = try event.encodeWorkflowTerminatedBytes(&terminated_bytes, .{ .principal = "a", .reason = "done" });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 4, 'a', 'd', 'o', 'n', 'e' }, terminated);
+}
+
 test "public package imports without initialization" {
     try std.testing.expect(@TypeOf(spindle) == type);
 }

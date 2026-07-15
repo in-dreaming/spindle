@@ -5,6 +5,7 @@ const event = @import("event.zig");
 const instance = @import("instance.zig");
 const persistence = @import("persistence.zig");
 const snapshot = @import("snapshot.zig");
+const definition_migration = @import("migration.zig");
 const store_health = @import("store_health.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -12,7 +13,7 @@ const c = @cImport({
 const sqlite_transient: c.sqlite3_destructor_type = @ptrFromInt(std.math.maxInt(usize));
 
 pub const max_payload_bytes: usize = 1024 * 1024;
-pub const Error = error{ WorkflowStoreInUse, MigrationMismatch, CorruptSchema, PayloadTooLarge, IdempotencyConflict, NotFound, StaleRuntimeEpoch, Conflict, DatabaseBusy, DatabaseFull, DatabaseIo, DatabaseReadOnly, DatabaseFailure, BackupInterrupted, MaintenanceCancelled, RestoreFailed };
+pub const Error = error{ WorkflowStoreInUse, MigrationMismatch, CorruptSchema, PayloadTooLarge, IdempotencyConflict, NotFound, StaleRuntimeEpoch, Conflict, DatabaseBusy, DatabaseFull, DatabaseIo, DatabaseReadOnly, DatabaseFailure, BackupInterrupted, MaintenanceCancelled, RestoreFailed, MigrationInProgress, MigrationFailed, Unauthorized, QuotaExceeded };
 pub const InstanceRecord = struct { id: core.StableId, definition_id: u64, definition_version: u32, status: instance.Status, state_version: u64, state: []u8 };
 pub const Claim = struct { task_id: core.StableId, workflow_id: core.StableId, state_version: u64, definition_id: u64, definition_version: u32, runtime_epoch: u64 };
 pub const ActivityClaim = struct { allocator: std.mem.Allocator, task_id: core.StableId, workflow_id: core.StableId, command_sequence: u64, attempt: u32, runtime_epoch: u64, scheduled_utc_ms: i64, started_utc_ms: i64, payload: []u8, schema: core.schema.SchemaKey };
@@ -46,9 +47,31 @@ pub const Commit = struct {
     scheduled: persistence.ScheduledWork = .{},
     updated_utc_ms: i64,
 };
+/// Input to one atomic definition switch. `steps` are pure state transforms.
+pub const DefinitionMigration = struct {
+    workflow_id: core.StableId,
+    tenant: []const u8,
+    namespace: []const u8,
+    target_version: u32,
+    target_hash: u64,
+    principal: []const u8,
+    reason: []const u8,
+    idempotency_key: []const u8,
+    authorized: bool = true,
+    request_hash: u64,
+    event_id: core.StableId,
+    task_id: core.StableId,
+    steps: []const definition_migration.Step,
+};
+pub const HistoryRecord = struct { sequence: u64, kind: u32, utc_ms: i64, schema: core.schema.SchemaKey, payload: []u8 };
+pub const Pending = struct { workflow_tasks: u64, activities: u64, timers: u64, outbox: u64 };
+pub const OperatorMutation = struct { workflow_id: core.StableId, tenant: []const u8, namespace: []const u8, principal: []const u8, reason: []const u8, idempotency_key: []const u8, authorized: bool, request_hash: u64 };
+pub const ArchiveCommit = struct { workflow_id: core.StableId, tenant: []const u8, namespace: []const u8, first_sequence: u64, last_sequence: u64, location: []const u8, checksum: u64, event_count: u64, retention_before_utc_ms: i64 };
+pub const ArchiveRecord = struct { first_sequence: u64, last_sequence: u64, checksum: u64, event_count: u64, location: []u8 };
 const migration_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v1;
 const migration_v2_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v2;
 const migration_v3_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v3;
+const migration_v4_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v4;
 
 /// One SQLite connection, serialized by this store. It owns the process-local SQLite store lock.
 pub const Store = struct {
@@ -107,6 +130,93 @@ pub const Store = struct {
         try self.commit();
     }
 
+    /// Transactionally audits a termination, including denied attempts without payload data.
+    pub fn operatorTerminate(self: *Store, value: OperatorMutation, event_id: core.StableId) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.operatorTerminate, .{ value, event_id });
+        if (value.principal.len == 0 or value.reason.len == 0 or value.idempotency_key.len == 0) return error.Unauthorized;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.audit(value, "terminate")) {
+            try self.commit();
+            if (!value.authorized) return error.Unauthorized;
+            return;
+        }
+        if (!value.authorized) {
+            try self.commit();
+            return error.Unauthorized;
+        }
+        const sequence = try self.nextSequence(value.tenant, value.namespace, value.workflow_id);
+        var marker: [max_payload_bytes]u8 = undefined;
+        const bytes = encodeTerminationPayload(marker[0..], value.principal, value.reason) catch return error.PayloadTooLarge;
+        try self.appendHistoryAt(value.tenant, value.namespace, value.workflow_id, sequence, event_id, event.Kind.workflow_terminated, event.workflow_terminated_schema, bytes, self.clock.utcNow());
+        const update = try self.prepare("UPDATE workflow_instance SET status='cancelled',next_sequence=next_sequence+1,updated_utc_ms=?4 WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running';");
+        defer self.finalize(update);
+        try self.bindText(update, 1, value.tenant);
+        try self.bindText(update, 2, value.namespace);
+        try self.bindId(update, 3, value.workflow_id);
+        try self.bindInt(update, 4, self.clock.utcNow());
+        _ = try self.step(update);
+        if (c.sqlite3_changes(self.db) != 1) return error.Conflict;
+        const task = try self.prepare("UPDATE workflow_task SET status='completed',claimed_epoch=NULL WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3;");
+        defer self.finalize(task);
+        try self.bindText(task, 1, value.tenant);
+        try self.bindText(task, 2, value.namespace);
+        try self.bindId(task, 3, value.workflow_id);
+        _ = try self.step(task);
+        try self.commit();
+    }
+
+    /// Transactionally audits and appends an operator cancellation request.
+    pub fn operatorCancel(self: *Store, value: OperatorMutation, event_id: core.StableId, task_id: core.StableId) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.operatorCancel, .{ value, event_id, task_id });
+        try self.validateOperatorMutation(value);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.audit(value, "cancel")) {
+            try self.commit();
+            if (!value.authorized) return error.Unauthorized;
+            return;
+        }
+        if (!value.authorized) {
+            try self.commit();
+            return error.Unauthorized;
+        }
+        try self.appendHistoryFact(value.tenant, value.namespace, value.workflow_id, event_id, event.Kind.cancellation_requested, .{ .id = 0, .version = 1 }, "", self.clock.utcNow());
+        try self.wakeWorkflow(value.tenant, value.namespace, value.workflow_id, task_id, self.clock.utcNow());
+        try self.commit();
+    }
+
+    /// Transactionally audits and republishes blocked or completed workflow work.
+    pub fn operatorRetry(self: *Store, value: OperatorMutation, task_id: core.StableId) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.operatorRetry, .{ value, task_id });
+        try self.validateOperatorMutation(value);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.audit(value, "retry")) {
+            try self.commit();
+            if (!value.authorized) return error.Unauthorized;
+            return;
+        }
+        if (!value.authorized) {
+            try self.commit();
+            return error.Unauthorized;
+        }
+        const clear = try self.prepare("UPDATE workflow_task SET status='completed',claimed_epoch=NULL WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='blocked';");
+        defer self.finalize(clear);
+        try self.bindText(clear, 1, value.tenant);
+        try self.bindText(clear, 2, value.namespace);
+        try self.bindId(clear, 3, value.workflow_id);
+        _ = try self.step(clear);
+        try self.wakeWorkflow(value.tenant, value.namespace, value.workflow_id, task_id, self.clock.utcNow());
+        try self.commit();
+    }
+
     pub fn deinit(self: *Store) void {
         self.invoke(Store.close, .{}) catch {};
         self.dispatcher.deinit();
@@ -134,7 +244,7 @@ pub const Store = struct {
         report.schema_version = @intCast(try self.scalarU64("SELECT max(version) FROM spindle_schema_migration;"));
         report.migration_hashes_valid = self.migrationHashesValid();
         const quick_ok = try self.quickCheck();
-        report.history_gaps = try self.scalarU64("SELECT count(*) FROM workflow_instance i WHERE i.next_sequence<>COALESCE((SELECT max(h.sequence)+1 FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),1) OR (SELECT count(*) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id)<>COALESCE((SELECT max(h.sequence) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),0);");
+        report.history_gaps = try self.scalarU64("SELECT count(*) FROM workflow_instance i WHERE i.next_sequence<>MAX(COALESCE((SELECT max(h.sequence) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),0),COALESCE((SELECT max(a.last_sequence) FROM workflow_history_archive a WHERE a.tenant=i.tenant AND a.namespace=i.namespace AND a.workflow_id=i.workflow_id),0))+1 OR EXISTS(SELECT 1 FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id GROUP BY h.workflow_id HAVING min(h.sequence)<>COALESCE((SELECT max(a.last_sequence)+1 FROM workflow_history_archive a WHERE a.tenant=i.tenant AND a.namespace=i.namespace AND a.workflow_id=i.workflow_id),1) OR count(*)<>max(h.sequence)-min(h.sequence)+1);");
         report.snapshot_checksum_failures = try self.snapshotFailures();
         report.orphan_records = try self.scalarU64("SELECT (SELECT count(*) FROM workflow_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+(SELECT count(*) FROM activity_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+(SELECT count(*) FROM durable_timer t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+(SELECT count(*) FROM outbox t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL);");
         report.pending_work = try self.scalarU64("SELECT (SELECT count(*) FROM workflow_task WHERE status IN ('ready','claimed'))+(SELECT count(*) FROM activity_task WHERE status_v2 IN ('ready','claimed'))+(SELECT count(*) FROM durable_timer WHERE status_v2 IN ('ready','claimed'))+(SELECT count(*) FROM outbox WHERE status_v2 IN ('ready','claimed'));");
@@ -338,6 +448,202 @@ pub const Store = struct {
         if (!try self.step(stmt)) return error.NotFound;
         const state = self.allocator.dupe(u8, self.columnBlob(stmt, 4)) catch return error.DatabaseFailure;
         return .{ .id = id, .definition_id = @intCast(self.columnInt(stmt, 0)), .definition_version = @intCast(self.columnInt(stmt, 1)), .status = parseStatus(self.columnText(stmt, 2)), .state_version = @intCast(self.columnInt(stmt, 3)), .state = state };
+    }
+
+    /// Copies ordered hot history for an authorized operator or archive reader.
+    pub fn readHistory(self: *Store, allocator: std.mem.Allocator, tenant: []const u8, namespace: []const u8, id: core.StableId) (Error || std.mem.Allocator.Error)![]HistoryRecord {
+        if (!self.onDispatcher()) return self.invoke(Store.readHistory, .{ allocator, tenant, namespace, id });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const stmt = try self.prepare("SELECT sequence,kind,event_utc_ms,schema_id,schema_version,payload FROM workflow_history WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 ORDER BY sequence;");
+        defer self.finalize(stmt);
+        try self.bindText(stmt, 1, tenant);
+        try self.bindText(stmt, 2, namespace);
+        try self.bindId(stmt, 3, id);
+        var records: std.ArrayListUnmanaged(HistoryRecord) = .empty;
+        errdefer {
+            for (records.items) |record| allocator.free(record.payload);
+            records.deinit(allocator);
+        }
+        while (try self.step(stmt)) {
+            try records.append(allocator, .{ .sequence = @intCast(self.columnInt(stmt, 0)), .kind = @intCast(self.columnInt(stmt, 1)), .utc_ms = self.columnInt(stmt, 2), .schema = .{ .id = @bitCast(self.columnInt(stmt, 3)), .version = @intCast(self.columnInt(stmt, 4)) }, .payload = try allocator.dupe(u8, self.columnBlob(stmt, 5)) });
+        }
+        if (records.items.len == 0) return error.NotFound;
+        return records.toOwnedSlice(allocator);
+    }
+
+    /// Returns pending work counts scoped to one tenant and namespace.
+    pub fn pending(self: *Store, tenant: []const u8, namespace: []const u8) Error!Pending {
+        if (!self.onDispatcher()) return self.invoke(Store.pending, .{ tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return .{
+            .workflow_tasks = try self.countPending("workflow_task", "status IN ('ready','claimed')", tenant, namespace),
+            .activities = try self.countPending("activity_task", "status_v2 IN ('ready','claimed')", tenant, namespace),
+            .timers = try self.countPending("durable_timer", "status_v2 IN ('ready','claimed')", tenant, namespace),
+            .outbox = try self.countPending("outbox", "status_v2 IN ('ready','claimed')", tenant, namespace),
+        };
+    }
+
+    pub fn instanceCount(self: *Store, tenant: []const u8, namespace: []const u8) Error!u64 {
+        if (!self.onDispatcher()) return self.invoke(Store.instanceCount, .{ tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const stmt = try self.prepare("SELECT count(*) FROM workflow_instance WHERE tenant=?1 AND namespace=?2;");
+        defer self.finalize(stmt);
+        try self.bindText(stmt, 1, tenant);
+        try self.bindText(stmt, 2, namespace);
+        if (!try self.step(stmt)) return 0;
+        return @intCast(self.columnInt(stmt, 0));
+    }
+
+    /// Returns payload-free audit row count for scoped operator diagnostics.
+    pub fn auditCount(self: *Store, tenant: []const u8, namespace: []const u8) Error!u64 {
+        if (!self.onDispatcher()) return self.invoke(Store.auditCount, .{ tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const stmt = try self.prepare("SELECT count(*) FROM workflow_operator_audit WHERE tenant=?1 AND namespace=?2;");
+        defer self.finalize(stmt);
+        try self.bindText(stmt, 1, tenant);
+        try self.bindText(stmt, 2, namespace);
+        if (!try self.step(stmt)) return 0;
+        return @intCast(self.columnInt(stmt, 0));
+    }
+
+    /// Records a verified archive and removes only its covered hot rows in one transaction.
+    pub fn commitArchive(self: *Store, value: ArchiveCommit) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.commitArchive, .{value});
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        const eligible = try self.prepare("SELECT 1 FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status<>'running' AND updated_utc_ms<=?4;");
+        defer self.finalize(eligible);
+        try self.bindText(eligible, 1, value.tenant);
+        try self.bindText(eligible, 2, value.namespace);
+        try self.bindId(eligible, 3, value.workflow_id);
+        try self.bindInt(eligible, 4, value.retention_before_utc_ms);
+        if (!try self.step(eligible)) return error.Conflict;
+        const coverage = try self.prepare("SELECT count(*),min(sequence),max(sequence) FROM workflow_history WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND sequence BETWEEN ?4 AND ?5;");
+        defer self.finalize(coverage);
+        try self.bindText(coverage, 1, value.tenant);
+        try self.bindText(coverage, 2, value.namespace);
+        try self.bindId(coverage, 3, value.workflow_id);
+        try self.bindInt(coverage, 4, value.first_sequence);
+        try self.bindInt(coverage, 5, value.last_sequence);
+        if (!try self.step(coverage) or self.columnInt(coverage, 0) != value.event_count or self.columnInt(coverage, 1) != value.first_sequence or self.columnInt(coverage, 2) != value.last_sequence) return error.Conflict;
+        const manifest = try self.prepare("INSERT INTO workflow_history_archive(tenant,namespace,workflow_id,first_sequence,last_sequence,location,checksum,event_count,created_utc_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
+        defer self.finalize(manifest);
+        try self.bindText(manifest, 1, value.tenant);
+        try self.bindText(manifest, 2, value.namespace);
+        try self.bindId(manifest, 3, value.workflow_id);
+        try self.bindInt(manifest, 4, value.first_sequence);
+        try self.bindInt(manifest, 5, value.last_sequence);
+        try self.bindText(manifest, 6, value.location);
+        try self.bindInt(manifest, 7, @as(i64, @bitCast(value.checksum)));
+        try self.bindInt(manifest, 8, value.event_count);
+        try self.bindInt(manifest, 9, self.clock.utcNow());
+        _ = try self.step(manifest);
+        const remove = try self.prepare("DELETE FROM workflow_history WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND sequence BETWEEN ?4 AND ?5;");
+        defer self.finalize(remove);
+        try self.bindText(remove, 1, value.tenant);
+        try self.bindText(remove, 2, value.namespace);
+        try self.bindId(remove, 3, value.workflow_id);
+        try self.bindInt(remove, 4, value.first_sequence);
+        try self.bindInt(remove, 5, value.last_sequence);
+        _ = try self.step(remove);
+        if (c.sqlite3_changes(self.db) != value.event_count) return error.Conflict;
+        try self.commit();
+    }
+
+    /// Copies archive manifests ordered before the hot history tail.
+    pub fn archiveRecords(self: *Store, allocator: std.mem.Allocator, tenant: []const u8, namespace: []const u8, id: core.StableId) (Error || std.mem.Allocator.Error)![]ArchiveRecord {
+        if (!self.onDispatcher()) return self.invoke(Store.archiveRecords, .{ allocator, tenant, namespace, id });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const stmt = try self.prepare("SELECT first_sequence,last_sequence,checksum,event_count,location FROM workflow_history_archive WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 ORDER BY first_sequence;");
+        defer self.finalize(stmt);
+        try self.bindText(stmt, 1, tenant);
+        try self.bindText(stmt, 2, namespace);
+        try self.bindId(stmt, 3, id);
+        var result: std.ArrayListUnmanaged(ArchiveRecord) = .empty;
+        errdefer {
+            for (result.items) |record| allocator.free(record.location);
+            result.deinit(allocator);
+        }
+        while (try self.step(stmt)) try result.append(allocator, .{ .first_sequence = @intCast(self.columnInt(stmt, 0)), .last_sequence = @intCast(self.columnInt(stmt, 1)), .checksum = @bitCast(self.columnInt(stmt, 2)), .event_count = @intCast(self.columnInt(stmt, 3)), .location = try allocator.dupe(u8, self.columnText(stmt, 4)) });
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Fences active work, applies pure state migration, appends its marker, and snapshots atomically.
+    pub fn migrateDefinition(self: *Store, value: DefinitionMigration) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.migrateDefinition, .{value});
+        const mutation = OperatorMutation{ .workflow_id = value.workflow_id, .tenant = value.tenant, .namespace = value.namespace, .principal = value.principal, .reason = value.reason, .idempotency_key = value.idempotency_key, .authorized = value.authorized, .request_hash = value.request_hash };
+        try self.validateOperatorMutation(mutation);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.audit(mutation, "migrate")) {
+            try self.commit();
+            if (!value.authorized) return error.Unauthorized;
+            return;
+        }
+        if (!value.authorized) {
+            try self.commit();
+            return error.Unauthorized;
+        }
+        const row = try self.prepare("SELECT definition_version,state,next_sequence FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running' AND migration_state='idle';");
+        defer self.finalize(row);
+        try self.bindText(row, 1, value.tenant);
+        try self.bindText(row, 2, value.namespace);
+        try self.bindId(row, 3, value.workflow_id);
+        if (!try self.step(row)) {
+            try self.commit();
+            return error.Conflict;
+        }
+        const from_version: u32 = @intCast(self.columnInt(row, 0));
+        const old_state = self.columnBlob(row, 1);
+        const next_sequence: u64 = @intCast(self.columnInt(row, 2));
+        const new_state = definition_migration.migrate(self.allocator, value.steps, from_version, value.target_version, old_state) catch {
+            try self.commit();
+            return error.MigrationFailed;
+        };
+        defer self.allocator.free(new_state);
+        if (new_state.len > max_payload_bytes) return error.PayloadTooLarge;
+        const fence = try self.prepare("UPDATE workflow_task SET status='blocked',blocked_definition_id=(SELECT definition_id FROM workflow_instance WHERE tenant=workflow_task.tenant AND namespace=workflow_task.namespace AND workflow_id=workflow_task.workflow_id),blocked_definition_version=(SELECT definition_version FROM workflow_instance WHERE tenant=workflow_task.tenant AND namespace=workflow_task.namespace AND workflow_id=workflow_task.workflow_id) WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='claimed';");
+        defer self.finalize(fence);
+        try self.bindText(fence, 1, value.tenant);
+        try self.bindText(fence, 2, value.namespace);
+        try self.bindId(fence, 3, value.workflow_id);
+        _ = try self.step(fence);
+        var payload: [max_payload_bytes]u8 = undefined;
+        const marker = encodeMigrationPayload(payload[0..], .{ .version = value.target_version, .hash = value.target_hash, .principal = value.principal, .reason = value.reason }) catch return error.PayloadTooLarge;
+        const history = try self.prepare("INSERT INTO workflow_history(tenant,namespace,workflow_id,sequence,event_id,kind,event_utc_ms,schema_id,schema_version,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+        defer self.finalize(history);
+        try self.bindText(history, 1, value.tenant);
+        try self.bindText(history, 2, value.namespace);
+        try self.bindId(history, 3, value.workflow_id);
+        try self.bindInt(history, 4, next_sequence);
+        try self.bindId(history, 5, value.event_id);
+        try self.bindInt(history, 6, event.Kind.definition_migrated);
+        try self.bindInt(history, 7, self.clock.utcNow());
+        try self.bindInt(history, 8, @as(i64, @bitCast(event.definition_migrated_schema.id)));
+        try self.bindInt(history, 9, event.definition_migrated_schema.version);
+        try self.bindBlob(history, 10, marker);
+        _ = try self.step(history);
+        const update = try self.prepare("UPDATE workflow_instance SET state=?4,definition_version=?5,next_sequence=next_sequence+1,migration_state='idle',updated_utc_ms=?6 WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3;");
+        defer self.finalize(update);
+        try self.bindText(update, 1, value.tenant);
+        try self.bindText(update, 2, value.namespace);
+        try self.bindId(update, 3, value.workflow_id);
+        try self.bindBlob(update, 4, new_state);
+        try self.bindInt(update, 5, value.target_version);
+        try self.bindInt(update, 6, self.clock.utcNow());
+        _ = try self.step(update);
+        try self.insertSnapshot(value.tenant, value.namespace, .{ .workflow_id = value.workflow_id, .event_sequence = next_sequence, .definition_version = value.target_version, .state = new_state, .checksum = snapshot.checksum(value.workflow_id, next_sequence, value.target_version, new_state) });
+        try self.wakeWorkflow(value.tenant, value.namespace, value.workflow_id, value.task_id, self.clock.utcNow());
+        try self.commit();
     }
 
     /// Claims at most one activity for this runtime epoch. The returned payload is caller-owned.
@@ -991,6 +1297,7 @@ pub const Store = struct {
         try self.applyOneMigration(1, migration_sql);
         try self.applyOneMigration(2, migration_v2_sql);
         try self.applyOneMigration(3, migration_v3_sql);
+        try self.applyOneMigration(4, migration_v4_sql);
     }
     fn recoverClaims(self: *Store) Error!store_health.Recovery {
         var recovery = store_health.Recovery{};
@@ -1010,11 +1317,76 @@ pub const Store = struct {
         if (!try self.step(statement)) return 0;
         return @intCast(self.columnInt(statement, 0));
     }
+    fn countPending(self: *Store, comptime table: []const u8, comptime predicate: []const u8, tenant: []const u8, namespace: []const u8) Error!u64 {
+        const statement = try self.prepare("SELECT count(*) FROM " ++ table ++ " WHERE tenant=?1 AND namespace=?2 AND " ++ predicate ++ ";");
+        defer self.finalize(statement);
+        try self.bindText(statement, 1, tenant);
+        try self.bindText(statement, 2, namespace);
+        if (!try self.step(statement)) return 0;
+        return @intCast(self.columnInt(statement, 0));
+    }
+    fn audit(self: *Store, value: OperatorMutation, action: []const u8) Error!bool {
+        const existing = try self.prepare("SELECT request_hash,authorized FROM workflow_operator_audit WHERE tenant=?1 AND namespace=?2 AND principal=?3 AND action=?4 AND idempotency_key=?5;");
+        defer self.finalize(existing);
+        try self.bindText(existing, 1, value.tenant);
+        try self.bindText(existing, 2, value.namespace);
+        try self.bindText(existing, 3, value.principal);
+        try self.bindText(existing, 4, action);
+        try self.bindText(existing, 5, value.idempotency_key);
+        if (try self.step(existing)) {
+            if (@as(u64, @bitCast(self.columnInt(existing, 0))) != value.request_hash) return error.IdempotencyConflict;
+            if ((self.columnInt(existing, 1) != 0) != value.authorized) return error.IdempotencyConflict;
+            return true;
+        }
+        const insert = try self.prepare("INSERT INTO workflow_operator_audit(tenant,namespace,workflow_id,principal,action,reason,idempotency_key,authorized,request_hash,created_utc_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+        defer self.finalize(insert);
+        try self.bindText(insert, 1, value.tenant);
+        try self.bindText(insert, 2, value.namespace);
+        try self.bindId(insert, 3, value.workflow_id);
+        try self.bindText(insert, 4, value.principal);
+        try self.bindText(insert, 5, action);
+        try self.bindText(insert, 6, value.reason);
+        try self.bindText(insert, 7, value.idempotency_key);
+        try self.bindInt(insert, 8, @intFromBool(value.authorized));
+        try self.bindInt(insert, 9, @as(i64, @bitCast(value.request_hash)));
+        try self.bindInt(insert, 10, self.clock.utcNow());
+        _ = try self.step(insert);
+        return false;
+    }
+    fn validateOperatorMutation(_: *Store, value: OperatorMutation) Error!void {
+        if (value.principal.len == 0 or value.reason.len == 0 or value.idempotency_key.len == 0) return error.Unauthorized;
+        if (value.principal.len > 256 or value.reason.len > 4096 or value.idempotency_key.len > 256) return error.PayloadTooLarge;
+    }
+    fn nextSequence(self: *Store, tenant: []const u8, namespace: []const u8, id: core.StableId) Error!u64 {
+        const stmt = try self.prepare("SELECT next_sequence FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running';");
+        defer self.finalize(stmt);
+        try self.bindText(stmt, 1, tenant);
+        try self.bindText(stmt, 2, namespace);
+        try self.bindId(stmt, 3, id);
+        if (!try self.step(stmt)) return error.NotFound;
+        return @intCast(self.columnInt(stmt, 0));
+    }
+    fn appendHistoryAt(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, sequence: u64, event_id: core.StableId, kind: u32, schema: core.schema.SchemaKey, payload: []const u8, utc_ms: i64) Error!void {
+        const stmt = try self.prepare("INSERT INTO workflow_history(tenant,namespace,workflow_id,sequence,event_id,kind,event_utc_ms,schema_id,schema_version,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+        defer self.finalize(stmt);
+        try self.bindText(stmt, 1, tenant);
+        try self.bindText(stmt, 2, namespace);
+        try self.bindId(stmt, 3, workflow_id);
+        try self.bindInt(stmt, 4, sequence);
+        try self.bindId(stmt, 5, event_id);
+        try self.bindInt(stmt, 6, kind);
+        try self.bindInt(stmt, 7, utc_ms);
+        try self.bindInt(stmt, 8, @as(i64, @bitCast(schema.id)));
+        try self.bindInt(stmt, 9, schema.version);
+        try self.bindBlob(stmt, 10, payload);
+        _ = try self.step(stmt);
+    }
     fn migrationHashesValid(self: *Store) bool {
         const first = self.migrationMatches(1, migration_sql) catch return false;
         const second = self.migrationMatches(2, migration_v2_sql) catch return false;
         const third = self.migrationMatches(3, migration_v3_sql) catch return false;
-        return first and second and third;
+        const fourth = self.migrationMatches(4, migration_v4_sql) catch return false;
+        return first and second and third and fourth;
     }
     fn migrationMatches(self: *Store, version: i64, sql: []const u8) Error!bool {
         const statement = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=?1;");
@@ -1142,6 +1514,24 @@ fn statusText(value: instance.Status) []const u8 {
         .cancelled => "cancelled",
     };
 }
+fn encodeMigrationPayload(buffer: []u8, value: event.DefinitionMigrated) error{PayloadTooLarge}![]const u8 {
+    if (value.principal.len > std.math.maxInt(u16) or value.reason.len > std.math.maxInt(u16) or 16 + value.principal.len + value.reason.len > buffer.len) return error.PayloadTooLarge;
+    std.mem.writeInt(u32, buffer[0..4], value.version, .big);
+    std.mem.writeInt(u64, buffer[4..12], value.hash, .big);
+    std.mem.writeInt(u16, buffer[12..14], @intCast(value.principal.len), .big);
+    std.mem.writeInt(u16, buffer[14..16], @intCast(value.reason.len), .big);
+    @memcpy(buffer[16 .. 16 + value.principal.len], value.principal);
+    @memcpy(buffer[16 + value.principal.len .. 16 + value.principal.len + value.reason.len], value.reason);
+    return buffer[0 .. 16 + value.principal.len + value.reason.len];
+}
+fn encodeTerminationPayload(buffer: []u8, principal: []const u8, reason: []const u8) error{PayloadTooLarge}![]const u8 {
+    if (principal.len > std.math.maxInt(u16) or reason.len > std.math.maxInt(u16) or 4 + principal.len + reason.len > buffer.len) return error.PayloadTooLarge;
+    std.mem.writeInt(u16, buffer[0..2], @intCast(principal.len), .big);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(reason.len), .big);
+    @memcpy(buffer[4 .. 4 + principal.len], principal);
+    @memcpy(buffer[4 + principal.len .. 4 + principal.len + reason.len], reason);
+    return buffer[0 .. 4 + principal.len + reason.len];
+}
 fn derivedEventId(base: core.StableId, sequence: i64) core.StableId {
     var bytes = base.toBytes();
     const high = std.mem.readInt(u64, bytes[0..8], .big) ^ 0x6576_656e_742e_7766;
@@ -1169,11 +1559,11 @@ fn quickCheckDb(db: *c.sqlite3) bool {
 }
 fn validateDb(db: *c.sqlite3) bool {
     if (!quickCheckDb(db)) return false;
-    if (!migrationDbMatches(db, 1, migration_sql) or !migrationDbMatches(db, 2, migration_v2_sql)) return false;
+    if (!migrationDbMatches(db, 1, migration_sql) or !migrationDbMatches(db, 2, migration_v2_sql) or !migrationDbMatches(db, 3, migration_v3_sql) or !migrationDbMatches(db, 4, migration_v4_sql)) return false;
     const invariant_failures = rawScalar(
         db,
         "SELECT " ++
-            "(SELECT count(*) FROM workflow_instance i WHERE i.next_sequence<>COALESCE((SELECT max(h.sequence)+1 FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),1) OR (SELECT count(*) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id)<>COALESCE((SELECT max(h.sequence) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),0))+" ++
+            "(SELECT count(*) FROM workflow_instance i WHERE i.next_sequence<>MAX(COALESCE((SELECT max(h.sequence) FROM workflow_history h WHERE h.tenant=i.tenant AND h.namespace=i.namespace AND h.workflow_id=i.workflow_id),0),COALESCE((SELECT max(a.last_sequence) FROM workflow_history_archive a WHERE a.tenant=i.tenant AND a.namespace=i.namespace AND a.workflow_id=i.workflow_id),0))+1)+" ++
             "(SELECT count(*) FROM workflow_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+" ++
             "(SELECT count(*) FROM activity_task t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+" ++
             "(SELECT count(*) FROM durable_timer t LEFT JOIN workflow_instance i ON i.tenant=t.tenant AND i.namespace=t.namespace AND i.workflow_id=t.workflow_id WHERE i.workflow_id IS NULL)+" ++

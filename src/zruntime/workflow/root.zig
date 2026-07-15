@@ -27,6 +27,12 @@ pub const store_health = if (build_options.workflow_sqlite) @import("store_healt
 pub const activity_worker = if (build_options.workflow_sqlite) @import("activity_worker.zig") else struct {};
 pub const timer_worker = if (build_options.workflow_sqlite) @import("timer_worker.zig") else struct {};
 pub const outbox = if (build_options.workflow_sqlite) @import("outbox.zig") else struct {};
+/// Authorized SQLite operator controls are absent from core-only builds.
+pub const operator = if (build_options.workflow_sqlite) @import("operator.zig") else struct {};
+/// Local archive codec and filesystem artifact store are absent unless enabled.
+pub const archive = if (build_options.workflow_archive) @import("archive.zig") else struct {};
+/// HTTP archive transport is linked only by the explicit HTTP archive feature.
+pub const archive_http = if (build_options.workflow_archive_http) @import("archive_http.zig") else struct {};
 pub const WorkflowId = instance.WorkflowId;
 pub const Definition = definition.Definition;
 pub const Registry = definition.Registry;

@@ -6,13 +6,19 @@ pub fn build(b: *std.Build) void {
     const stress_iterations = b.option(u32, "stress-iterations", "Iterations used by bounded stress tests") orelse 128;
     const workflow_enabled = b.option(bool, "workflow", "Build the database-independent workflow protocol") orelse true;
     const workflow_sqlite_enabled = b.option(bool, "workflow-sqlite", "Build the embedded SQLite workflow store") orelse false;
+    const workflow_archive_enabled = b.option(bool, "workflow-archive", "Build local workflow history archival") orelse false;
+    const workflow_archive_http_enabled = b.option(bool, "workflow-archive-http", "Build HTTP workflow archive transport") orelse false;
     if (workflow_sqlite_enabled and !workflow_enabled) {
         @panic("-Dworkflow-sqlite=true implies -Dworkflow=true; do not disable workflow");
     }
+    if (workflow_archive_enabled and !workflow_sqlite_enabled) @panic("-Dworkflow-archive=true implies -Dworkflow-sqlite=true");
+    if (workflow_archive_http_enabled and !workflow_archive_enabled) @panic("-Dworkflow-archive-http=true implies -Dworkflow-archive=true");
 
     const base_options = b.addOptions();
     base_options.addOption(bool, "workflow", workflow_enabled);
     base_options.addOption(bool, "workflow_sqlite", workflow_sqlite_enabled);
+    base_options.addOption(bool, "workflow_archive", workflow_archive_enabled);
+    base_options.addOption(bool, "workflow_archive_http", workflow_archive_http_enabled);
 
     const spindle = b.addModule("spindle", .{
         .root_source_file = b.path("src/root.zig"),
@@ -94,6 +100,8 @@ pub fn build(b: *std.Build) void {
     const sqlite_options = b.addOptions();
     sqlite_options.addOption(bool, "workflow", true);
     sqlite_options.addOption(bool, "workflow_sqlite", true);
+    sqlite_options.addOption(bool, "workflow_archive", false);
+    sqlite_options.addOption(bool, "workflow_archive_http", false);
     const sqlite_module = b.addModule("spindle_sqlite", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     sqlite_module.addOptions("build_options", sqlite_options);
     configureSqlite(b, sqlite_module, target, optimize);
@@ -111,9 +119,34 @@ pub fn build(b: *std.Build) void {
     sqlite_tests.root_module.addOptions("build_options", sqlite_test_options);
     const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
     sqlite_step.dependOn(&run_sqlite_tests.step);
+    const archive_options = b.addOptions();
+    archive_options.addOption(bool, "workflow", true);
+    archive_options.addOption(bool, "workflow_sqlite", true);
+    archive_options.addOption(bool, "workflow_archive", true);
+    archive_options.addOption(bool, "workflow_archive_http", false);
+    const archive_module = b.addModule("spindle_archive", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    archive_module.addOptions("build_options", archive_options);
+    configureSqlite(b, archive_module, target, optimize);
+    const archive_tests = addTest(b, "tests/integration/workflow_archive.zig", target, optimize, archive_module);
+    const archive_login_fixture = b.createModule(.{ .root_source_file = b.path("tests/fixtures/login_workflow.zig"), .target = target, .optimize = optimize });
+    archive_login_fixture.addImport("spindle", archive_module);
+    archive_tests.root_module.addImport("login_workflow", archive_login_fixture);
+    sqlite_step.dependOn(&b.addRunArtifact(archive_tests).step);
+    const archive_http_options = b.addOptions();
+    archive_http_options.addOption(bool, "workflow", true);
+    archive_http_options.addOption(bool, "workflow_sqlite", true);
+    archive_http_options.addOption(bool, "workflow_archive", true);
+    archive_http_options.addOption(bool, "workflow_archive_http", true);
+    const archive_http_module = b.addModule("spindle_archive_http", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    archive_http_module.addOptions("build_options", archive_http_options);
+    configureSqlite(b, archive_http_module, target, optimize);
+    const archive_http_tests = addTest(b, "tests/integration/workflow_archive_http_feature.zig", target, optimize, archive_http_module);
+    sqlite_step.dependOn(&b.addRunArtifact(archive_http_tests).step);
     const workflow_off_options = b.addOptions();
     workflow_off_options.addOption(bool, "workflow", false);
     workflow_off_options.addOption(bool, "workflow_sqlite", false);
+    workflow_off_options.addOption(bool, "workflow_archive", false);
+    workflow_off_options.addOption(bool, "workflow_archive_http", false);
     const workflow_off_module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     workflow_off_module.addOptions("build_options", workflow_off_options);
     const workflow_off_tests = addTest(b, "tests/integration/workflow_feature_off.zig", target, optimize, workflow_off_module);
