@@ -1,0 +1,17 @@
+.{
+    .fingerprint = 0xbf5b5f85177c32db,
+    .name = .spindle,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "bench",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}
