@@ -8,7 +8,13 @@ pub const ResourceNodeId = packed struct(u32) {
 };
 pub const Hazard = enum(u8) { raw, war, waw, explicit };
 pub const Diagnostic = struct { from: ResourceNodeId, to: ResourceNodeId, resource: key.ResourceKey, mode: access.AccessMode, hazard: Hazard };
-pub const ResourceTask = struct { name: []const u8, run_context: ?*anyopaque = null, run: ?*const fn (?*anyopaque) void = null };
+pub const ResourceTask = struct {
+    name: []const u8,
+    run_context: ?*anyopaque = null,
+    run: ?*const fn (?*anyopaque) void = null,
+    /// Optional fallible execution path. A failure stops new downstream submissions.
+    run_result: ?*const fn (?*anyopaque) anyerror!void = null,
+};
 pub const Node = struct { id: ResourceNodeId, task: ResourceTask, dependency_start: usize, dependency_len: usize, dependent_start: usize, dependent_len: usize };
 /// Immutable dependency plan. Per-run state belongs to Task 13's scheduler, not this object.
 pub const CompiledResourcePlan = struct {

@@ -35,11 +35,23 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = addTest(b, "tests/unit.zig", target, optimize, spindle);
     const integration_tests = addTest(b, "tests/integration/root.zig", target, optimize, spindle);
+    const recovery_tests = addTest(b, "tests/integration/resource_recovery.zig", target, optimize, spindle);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const run_integration_tests = b.addRunArtifact(integration_tests);
+    const run_recovery_tests = b.addRunArtifact(recovery_tests);
     const test_step = b.step("test", "Run unit and non-external-service integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_recovery_tests.step);
+
+    const fault_fixture = b.addExecutable(.{ .name = "resource-commit-fault", .root_module = b.createModule(.{ .root_source_file = b.path("tests/fixtures/resource_commit_fault.zig"), .target = target, .optimize = optimize }) });
+    const fault_stages = [_][]const u8{ "before-record", "after-record", "after-pointer" };
+    for (fault_stages) |stage| {
+        const run_fault = b.addRunArtifact(fault_fixture);
+        run_fault.addArg(stage);
+        run_fault.addArg(b.fmt("spindle-task13-child-{s}", .{stage}));
+        run_recovery_tests.step.dependOn(&run_fault.step);
+    }
 
     const stress_options = b.addOptions();
     stress_options.addOption(u32, "iterations", stress_iterations);
