@@ -183,3 +183,41 @@ test "work-stealing submit shutdown race is bounded and releases every queue ref
     runner.join();
     try std.testing.expect(passed.load(.acquire));
 }
+
+const GraphStressProbe = struct {
+    count: *std.atomic.Value(u32),
+    fn run(context: *spindle.task_graph.TaskContext) void {
+        const self: *GraphStressProbe = @ptrCast(@alignCast(context.user_context.?));
+        _ = self.count.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "local task graph high fan-in releases its join exactly once" {
+    const fan_in = 32;
+    const iterations = @min(build_options.iterations, 16);
+    var executor = try spindle.executor.FixedPool.init(std.testing.allocator, 4, 128);
+    defer executor.deinit();
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    const target = try registry.register(executor.executor());
+    var count: std.atomic.Value(u32) = .init(0);
+    var probes: [fan_in + 1]GraphStressProbe = undefined;
+    for (&probes) |*probe| probe.* = .{ .count = &count };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    var inputs: [fan_in]spindle.task_graph.NodeId = undefined;
+    for (&inputs, 0..) |*id, i| id.* = try builder.addTask(target, &probes[i], GraphStressProbe.run);
+    const join = try builder.addTask(target, &probes[fan_in], GraphStressProbe.run);
+    for (inputs) |input| try builder.dependsOn(join, input);
+    var graph = try builder.compile(std.testing.allocator, &registry);
+    defer graph.deinit();
+    for (0..iterations) |_| {
+        var handle = try spindle.task_graph.start(std.testing.allocator, &graph, null);
+        try handle.wait();
+        const snapshot = handle.snapshot();
+        try std.testing.expectEqual(snapshot.total, snapshot.completed);
+        try std.testing.expectEqual(spindle.task_graph.LocalTaskState.completed, snapshot.states[fan_in]);
+        handle.deinit();
+    }
+    try std.testing.expectEqual(@as(u32, fan_in + 1) * iterations, count.load(.acquire));
+}

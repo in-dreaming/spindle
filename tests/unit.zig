@@ -589,3 +589,167 @@ test "blocking bridge is bounded and does not consume compute workers" {
     try queued_second.wait();
     try std.testing.expect(finished.load(.acquire) >= 3);
 }
+
+const GraphProbe = struct {
+    value: *std.atomic.Value(u32),
+    fail: bool = false,
+    fn run(context: *spindle.task_graph.TaskContext) void {
+        const self: *GraphProbe = @ptrCast(@alignCast(context.user_context.?));
+        _ = self.value.fetchAdd(1, .acq_rel);
+        if (self.fail) context.fail();
+    }
+};
+
+test "local task graph compiles a DAG and executes each dependency once" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var inline_executor: spindle.executor.InlineExecutor = .{};
+    const target = try registry.register(inline_executor.executor());
+    var value: std.atomic.Value(u32) = .init(0);
+    var first_probe = GraphProbe{ .value = &value };
+    var second_probe = GraphProbe{ .value = &value };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    const first = try builder.addTask(target, &first_probe, GraphProbe.run);
+    const second = try builder.addTask(target, &second_probe, GraphProbe.run);
+    try builder.dependsOn(second, first);
+    var graph = try builder.compile(std.testing.allocator, &registry);
+    defer graph.deinit();
+    var handle = try spindle.task_graph.start(std.testing.allocator, &graph, null);
+    defer handle.deinit();
+    try handle.wait();
+    try std.testing.expectEqual(@as(u32, 2), value.load(.acquire));
+    const snapshot = handle.snapshot();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.completed);
+    try std.testing.expectEqual(spindle.task_graph.LocalTaskState.completed, snapshot.states[0]);
+    try std.testing.expectEqual(spindle.task_graph.LocalTaskState.completed, snapshot.states[1]);
+}
+
+test "local task graph rejects cycles before task execution" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var inline_executor: spindle.executor.InlineExecutor = .{};
+    const target = try registry.register(inline_executor.executor());
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = GraphProbe{ .value = &value };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    const a = try builder.addTask(target, &probe, GraphProbe.run);
+    const b = try builder.addTask(target, &probe, GraphProbe.run);
+    try builder.dependsOn(a, b);
+    try builder.dependsOn(b, a);
+    try std.testing.expectError(error.CycleDetected, builder.compile(std.testing.allocator, &registry));
+    try std.testing.expectEqual(@as(u32, 0), value.load(.acquire));
+}
+
+test "local task graph waits for caller-driven pump routing" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 4);
+    defer pump.deinit();
+    const target = try registry.register(pump.executor());
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = GraphProbe{ .value = &value };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    _ = try builder.addTask(target, &probe, GraphProbe.run);
+    var graph = try builder.compile(std.testing.allocator, &registry);
+    defer graph.deinit();
+    var handle = try spindle.task_graph.start(std.testing.allocator, &graph, null);
+    defer handle.deinit();
+    try std.testing.expectEqual(@as(usize, 0), handle.snapshot().completed);
+    try std.testing.expectEqual(@as(usize, 1), pump.drain(1));
+    try handle.wait();
+    try std.testing.expectEqual(@as(u32, 1), value.load(.acquire));
+}
+
+test "local task graph propagates failure and explicit cancellation" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 4);
+    defer pump.deinit();
+    const target = try registry.register(pump.executor());
+    var value: std.atomic.Value(u32) = .init(0);
+    var failed_probe = GraphProbe{ .value = &value, .fail = true };
+    var child_probe = GraphProbe{ .value = &value };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    const failed = try builder.addTask(target, &failed_probe, GraphProbe.run);
+    const child = try builder.addTask(target, &child_probe, GraphProbe.run);
+    try builder.dependsOn(child, failed);
+    var graph = try builder.compile(std.testing.allocator, &registry);
+    defer graph.deinit();
+    var failed_handle = try spindle.task_graph.start(std.testing.allocator, &graph, null);
+    defer failed_handle.deinit();
+    _ = pump.drain(1);
+    try std.testing.expectError(error.GraphFailed, failed_handle.wait());
+    try std.testing.expectEqual(@as(u32, 1), value.load(.acquire));
+    try std.testing.expectEqual(spindle.task_graph.LocalTaskState.cancelled, failed_handle.snapshot().states[1]);
+
+    value.store(0, .release);
+    var cancel_builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer cancel_builder.deinit();
+    _ = try cancel_builder.addTask(target, &child_probe, GraphProbe.run);
+    var cancel_graph = try cancel_builder.compile(std.testing.allocator, &registry);
+    defer cancel_graph.deinit();
+    var cancel_handle = try spindle.task_graph.start(std.testing.allocator, &cancel_graph, null);
+    defer cancel_handle.deinit();
+    cancel_handle.cancel();
+    _ = pump.drain(1);
+    try std.testing.expectError(error.Cancelled, cancel_handle.wait());
+    try std.testing.expectEqual(@as(u32, 0), value.load(.acquire));
+}
+
+test "local task graph emits matched started terminal trace events" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var inline_executor: spindle.executor.InlineExecutor = .{};
+    const target = try registry.register(inline_executor.executor());
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = GraphProbe{ .value = &value };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    _ = try builder.addTask(target, &probe, GraphProbe.run);
+    var graph = try builder.compile(std.testing.allocator, &registry);
+    defer graph.deinit();
+    var events: [8]spindle.observability.event.Event = undefined;
+    var ring = spindle.observability.event.RingSink.init(&events);
+    var handle = try spindle.task_graph.start(std.testing.allocator, &graph, ring.sink());
+    defer handle.deinit();
+    try handle.wait();
+    var started: usize = 0;
+    var terminal: usize = 0;
+    while (ring.pop()) |event| {
+        if (std.mem.eql(u8, event.kind, "task_graph.started")) started += 1;
+        if (std.mem.eql(u8, event.kind, "task_graph.finished") or std.mem.eql(u8, event.kind, "task_graph.cancelled")) terminal += 1;
+    }
+    try std.testing.expectEqual(started, terminal);
+    try std.testing.expectEqual(@as(usize, 1), started);
+}
+
+test "compiled local task graph has independent concurrent execution state" {
+    var registry = spindle.executor.ExecutorRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var pool = try spindle.executor.FixedPool.init(std.testing.allocator, 2, 16);
+    defer pool.deinit();
+    const target = try registry.register(pool.executor());
+    var value: std.atomic.Value(u32) = .init(0);
+    var probes: [3]GraphProbe = undefined;
+    for (&probes) |*probe| probe.* = .{ .value = &value };
+    var builder = spindle.task_graph.LocalTaskGraph.init(std.testing.allocator);
+    defer builder.deinit();
+    const left = try builder.addTask(target, &probes[0], GraphProbe.run);
+    const right = try builder.addTask(target, &probes[1], GraphProbe.run);
+    const join = try builder.addTask(target, &probes[2], GraphProbe.run);
+    try builder.dependsOn(join, left);
+    try builder.dependsOn(join, right);
+    var graph = try builder.compile(std.testing.allocator, &registry);
+    defer graph.deinit();
+    var first = try spindle.task_graph.start(std.testing.allocator, &graph, null);
+    defer first.deinit();
+    var second = try spindle.task_graph.start(std.testing.allocator, &graph, null);
+    defer second.deinit();
+    try first.wait();
+    try second.wait();
+    try std.testing.expectEqual(@as(u32, 6), value.load(.acquire));
+}

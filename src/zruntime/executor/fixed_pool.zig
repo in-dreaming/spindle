@@ -59,6 +59,7 @@ pub const FixedPool = struct {
                         continue;
                     };
                     helping.execute();
+                    helping.releaseQueueReference();
                     continue;
                 },
                 error.Closed => {
@@ -109,6 +110,7 @@ pub const FixedPool = struct {
                 error.Closed => break,
             };
             task.execute();
+            task.releaseQueueReference();
         }
     }
     fn disposeTask(task: *Task) void {
