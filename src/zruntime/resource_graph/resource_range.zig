@@ -1,6 +1,6 @@
 const key = @import("resource_key.zig");
 
-/// Range declarations. MVP accepts only whole resources and pages.
+/// Range declarations. Byte ranges are half-open and participate in hazard checks.
 pub const ResourceRange = union(enum) {
     whole,
     page: u64,
@@ -11,7 +11,8 @@ pub const ResourceRange = union(enum) {
         return switch (self) {
             .whole => {},
             .page => if (resource.kind != .file and resource.kind != .page) error.InvalidPageRange else {},
-            .byte, .texture, .custom => error.UnsupportedRange,
+            .byte => |range| if (range.start >= range.end) error.InvalidByteRange else {},
+            .texture, .custom => error.UnsupportedRange,
         };
     }
     pub fn overlaps(a: ResourceRange, b: ResourceRange) bool {
@@ -20,6 +21,11 @@ pub const ResourceRange = union(enum) {
             .page => |p| switch (b) {
                 .whole => true,
                 .page => |q| p == q,
+                else => false,
+            },
+            .byte => |left| switch (b) {
+                .whole => true,
+                .byte => |right| left.start < right.end and right.start < left.end,
                 else => false,
             },
             else => false,

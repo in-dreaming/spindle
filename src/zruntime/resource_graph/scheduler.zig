@@ -4,10 +4,16 @@ const budget_mod = @import("budget.zig");
 const executor = @import("../executor/root.zig");
 const Mutex = @import("../sync/adaptive_mutex.zig").AdaptiveMutex;
 const EventSink = @import("../observability/event.zig").EventSink;
+const cost_mod = @import("cost.zig");
 
 pub const State = enum { pending, ready, budget_blocked, running, completed, cancelled, failed };
 pub const Route = enum { compute, blocking, pump };
-pub const TaskOptions = struct { cost: budget_mod.ResourceCost = .{}, route: Route = .compute };
+pub const TaskOptions = struct {
+    cost: budget_mod.ResourceCost = .{},
+    route: Route = .compute,
+    /// Historical runtime estimate used only to order already-admissible work.
+    estimate: ?*cost_mod.Estimate = null,
+};
 pub const Snapshot = struct { ready: usize, runnable: usize, running: usize, budget_blocked: usize, completed: usize, states: []const State };
 pub const Metrics = struct { ready: u64, budget_blocked: u64, started: u64, completed: u64, failed: u64, released: u64 };
 
@@ -22,6 +28,7 @@ pub const ExecutionHandle = struct {
     remaining: []usize,
     tasks: []executor.Task,
     items: []Item,
+    downstream_unlock: []u32,
     sink: ?EventSink = null,
     metric_ready: std.atomic.Value(u64) = .init(0),
     metric_blocked: std.atomic.Value(u64) = .init(0),
@@ -33,6 +40,7 @@ pub const ExecutionHandle = struct {
     cancelled: bool = false,
     pub fn deinit(self: *ExecutionHandle) void {
         self.allocator.free(self.items);
+        self.allocator.free(self.downstream_unlock);
         self.allocator.free(self.tasks);
         self.allocator.free(self.remaining);
         self.allocator.free(self.states);
@@ -73,6 +81,7 @@ pub const ExecutionHandle = struct {
         item.handle.runNode(item.index);
     }
     fn runNode(self: *ExecutionHandle, index: usize) void {
+        const started_ns = std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds;
         var failed = false;
         if (self.plan.nodes[index].task.run_result) |run| {
             run(self.plan.nodes[index].task.run_context) catch {
@@ -82,6 +91,10 @@ pub const ExecutionHandle = struct {
         self.lock.lock();
         defer self.lock.unlock();
         self.budget.release(self.options[index].cost);
+        if (self.options[index].estimate) |estimate| {
+            const now_ns = std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds;
+            estimate.observe(@intCast(now_ns -| started_ns));
+        }
         _ = self.metric_released.fetchAdd(1, .monotonic);
         self.event("resource_graph.release", @intCast(index));
         self.states[index] = if (failed) .failed else .completed;
@@ -108,7 +121,11 @@ pub const ExecutionHandle = struct {
         self.dispatchLocked();
     }
     fn dispatchLocked(self: *ExecutionHandle) void {
-        for (self.states, 0..) |*state, index| if (state.* == .ready or state.* == .budget_blocked) {
+        for (self.states) |*state| {
+            if (state.* == .budget_blocked) state.* = .ready;
+        }
+        while (self.nextReady()) |index| {
+            const state = &self.states[index];
             if (!self.budget.canEverFit(self.options[index].cost)) {
                 state.* = .failed;
                 _ = self.metric_failed.fetchAdd(1, .monotonic);
@@ -129,9 +146,24 @@ pub const ExecutionHandle = struct {
                 self.budget.release(self.options[index].cost);
                 state.* = .ready;
             };
-        };
+        }
+    }
+    fn nextReady(self: *ExecutionHandle) ?usize {
+        var selected: ?usize = null;
+        for (self.states, 0..) |state, index| {
+            if (state != .ready) continue;
+            if (selected) |current| {
+                const candidate = cost_mod.Score{ .node = @intCast(index), .downstream_unlock = self.downstream_unlock[index], .estimate = estimateFor(self.options[index]) };
+                const existing = cost_mod.Score{ .node = @intCast(current), .downstream_unlock = self.downstream_unlock[current], .estimate = estimateFor(self.options[current]) };
+                if (cost_mod.less({}, candidate, existing)) selected = index;
+            } else selected = index;
+        }
+        return selected;
     }
 };
+fn estimateFor(options: TaskOptions) cost_mod.Estimate {
+    return options.estimate orelse .{};
+}
 const Item = struct { handle: *ExecutionHandle, index: usize };
 
 /// Starts a run and routes compute, blocking, and pump work through the supplied executors.
@@ -151,13 +183,22 @@ pub fn startWithSink(allocator: std.mem.Allocator, plan: *const plan_mod.Compile
     errdefer allocator.free(tasks);
     const items = try allocator.alloc(Item, plan.nodes.len);
     errdefer allocator.free(items);
-    handle.* = .{ .allocator = allocator, .plan = plan, .budget = budget, .executors = .{ compute, blocking, pump }, .options = options, .states = states, .remaining = remaining, .tasks = tasks, .items = items, .sink = sink };
+    const downstream_unlock = try allocator.alloc(u32, plan.nodes.len);
+    errdefer allocator.free(downstream_unlock);
+    handle.* = .{ .allocator = allocator, .plan = plan, .budget = budget, .executors = .{ compute, blocking, pump }, .options = options, .states = states, .remaining = remaining, .tasks = tasks, .items = items, .downstream_unlock = downstream_unlock, .sink = sink };
     for (plan.nodes, 0..) |node, i| {
         states[i] = if (node.dependency_len == 0) .ready else .pending;
         if (node.dependency_len == 0) _ = handle.metric_ready.fetchAdd(1, .monotonic);
         remaining[i] = node.dependency_len;
         items[i] = .{ .handle = handle, .index = i };
         tasks[i] = executor.Task.init(ExecutionHandle.taskRun, &items[i]);
+    }
+    for (0..plan.nodes.len) |offset| {
+        const index = plan.nodes.len - 1 - offset;
+        var score: u32 = 0;
+        const node = plan.nodes[index];
+        for (plan.dependents[node.dependent_start .. node.dependent_start + node.dependent_len]) |child| score += 1 + downstream_unlock[child];
+        downstream_unlock[index] = score;
     }
     handle.lock.lock();
     handle.dispatchLocked();
