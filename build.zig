@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     const base_options = b.addOptions();
     base_options.addOption(bool, "workflow", workflow_enabled);
-    base_options.addOption(bool, "workflow_sqlite", false);
+    base_options.addOption(bool, "workflow_sqlite", workflow_sqlite_enabled);
 
     const spindle = b.addModule("spindle", .{
         .root_source_file = b.path("src/root.zig"),
