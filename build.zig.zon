@@ -3,7 +3,16 @@
     .name = .spindle,
     .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    // SQLite 3.50.4 amalgamation, public domain. It is resolved only by
+    // `-Dworkflow-sqlite=true`; build.zig compiles it with SQLITE_THREADSAFE=1,
+    // SQLITE_DEFAULT_SYNCHRONOUS=3 and SQLITE_OMIT_LOAD_EXTENSION.
+    .dependencies = .{
+        .sqlite_amalgamation = .{
+            .url = "https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip",
+            .hash = "N-V-__8AAHCbqABM_X5RTjbDBDBWErxZE8tJzmtEnLOLRHGx",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -13,5 +22,6 @@
         "examples",
         "README.md",
         "LICENSE",
+        "db",
     },
 }

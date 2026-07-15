@@ -90,5 +90,8 @@ pub fn run(allocator: std.mem.Allocator, target: executor.Executor, comptime T: 
     var consumer_task = executor.Task.init(State.consumer, &state);
     try scope.spawn(&producer_task);
     try scope.spawn(&consumer_task);
-    try scope.wait();
+    const scope_result = scope.wait();
+    try producer_task.waitQueueReleased();
+    try consumer_task.waitQueueReleased();
+    try scope_result;
 }

@@ -10,6 +10,8 @@ pub const ErrorCode = enum(u32) {
     resource_exhausted = 7,
     corrupt_data = 8,
     internal = 9,
+    unauthorized = 10,
+    idempotency_conflict = 11,
     unknown = 0xffff_ffff,
 };
 
@@ -46,7 +48,7 @@ pub fn fromInternal(err: anyerror) ErrorEnvelope {
 pub fn classify(code: ErrorCode) FailureClass {
     return switch (code) {
         .ok => .none,
-        .invalid_argument, .not_found, .conflict => .caller,
+        .invalid_argument, .not_found, .conflict, .unauthorized, .idempotency_conflict => .caller,
         .cancelled => .cancelled,
         .deadline_exceeded, .unavailable, .resource_exhausted => .transient,
         .corrupt_data => .corruption,

@@ -4,15 +4,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const stress_iterations = b.option(u32, "stress-iterations", "Iterations used by bounded stress tests") orelse 128;
-    const postgres_url = b.option([]const u8, "postgres-url", "PostgreSQL connection URL for integration tests");
-    const postgres_enabled = b.option(bool, "postgres", "Build PostgreSQL/libpq backend") orelse false;
-    const postgres_dsn = postgres_url;
+    const workflow_enabled = b.option(bool, "workflow", "Build the database-independent workflow protocol") orelse true;
+    const workflow_sqlite_enabled = b.option(bool, "workflow-sqlite", "Build the embedded SQLite workflow store") orelse false;
+    if (workflow_sqlite_enabled and !workflow_enabled) {
+        @panic("-Dworkflow-sqlite=true implies -Dworkflow=true; do not disable workflow");
+    }
+
+    const base_options = b.addOptions();
+    base_options.addOption(bool, "workflow", workflow_enabled);
+    base_options.addOption(bool, "workflow_sqlite", false);
 
     const spindle = b.addModule("spindle", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    spindle.addOptions("build_options", base_options);
+    if (workflow_sqlite_enabled) configureSqlite(b, spindle, target, optimize);
 
     const library = b.addLibrary(.{
         .name = "spindle",
@@ -82,21 +90,42 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmark smoke workload");
     bench_step.dependOn(&run_bench.step);
 
-    const postgres_step = b.step("test-postgres", "Run real PostgreSQL integration tests");
-    // This target deliberately always links libpq: it never falls back to an in-memory or SQLite substitute.
-    const postgres_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tests/integration/workflow_postgres.zig"), .target = target, .optimize = optimize }) });
-    postgres_tests.root_module.addImport("spindle", spindle);
-    postgres_tests.root_module.addImport("workflow_postgres", b.createModule(.{ .root_source_file = b.path("src/zruntime/workflow/postgres.zig"), .target = target, .optimize = optimize }));
-    postgres_tests.root_module.linkSystemLibrary("pq", .{});
-    const run_postgres_tests = b.addRunArtifact(postgres_tests);
-    if (postgres_dsn) |url| run_postgres_tests.setEnvironmentVariable("SPINDLE_TEST_PG_DSN", url);
-    postgres_step.dependOn(&run_postgres_tests.step);
+    const sqlite_step = b.step("test-sqlite", "Run real SQLite workflow persistence tests");
+    const sqlite_options = b.addOptions();
+    sqlite_options.addOption(bool, "workflow", true);
+    sqlite_options.addOption(bool, "workflow_sqlite", true);
+    const sqlite_module = b.addModule("spindle_sqlite", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    sqlite_module.addOptions("build_options", sqlite_options);
+    configureSqlite(b, sqlite_module, target, optimize);
+    const sqlite_tests = addTest(b, "tests/integration/workflow_sqlite.zig", target, optimize, sqlite_module);
+    const sqlite_test_dependency = b.lazyDependency("sqlite_amalgamation", .{}) orelse @panic("SQLite dependency is required by test-sqlite");
+    sqlite_tests.root_module.addIncludePath(sqlite_test_dependency.path("."));
+    const login_fixture = b.createModule(.{ .root_source_file = b.path("tests/fixtures/login_workflow.zig"), .target = target, .optimize = optimize });
+    login_fixture.addImport("spindle", sqlite_module);
+    sqlite_tests.root_module.addImport("login_workflow", login_fixture);
+    const crash_fixture = b.addExecutable(.{ .name = "workflow-crash-worker", .root_module = b.createModule(.{ .root_source_file = b.path("tests/fixtures/workflow_crash_worker.zig"), .target = target, .optimize = optimize }) });
+    crash_fixture.root_module.addImport("spindle", sqlite_module);
+    crash_fixture.root_module.addImport("login_workflow", login_fixture);
+    const sqlite_test_options = b.addOptions();
+    sqlite_test_options.addOptionPath("crash_fixture", crash_fixture.getEmittedBin());
+    sqlite_tests.root_module.addOptions("build_options", sqlite_test_options);
+    const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
+    sqlite_step.dependOn(&run_sqlite_tests.step);
+    const workflow_off_options = b.addOptions();
+    workflow_off_options.addOption(bool, "workflow", false);
+    workflow_off_options.addOption(bool, "workflow_sqlite", false);
+    const workflow_off_module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    workflow_off_module.addOptions("build_options", workflow_off_options);
+    const workflow_off_tests = addTest(b, "tests/integration/workflow_feature_off.zig", target, optimize, workflow_off_module);
+    sqlite_step.dependOn(&b.addRunArtifact(workflow_off_tests).step);
+    const workflow_core_tests = addTest(b, "tests/integration/workflow_feature_core.zig", target, optimize, spindle);
+    sqlite_step.dependOn(&b.addRunArtifact(workflow_core_tests).step);
 
-    const test_all = b.step("test-all", "Run all non-PostgreSQL validation suites");
+    const test_all = b.step("test-all", "Run all validation suites");
     test_all.dependOn(check);
     test_all.dependOn(test_step);
     test_all.dependOn(stress_step);
-    if (postgres_enabled or postgres_dsn != null) test_all.dependOn(postgres_step);
+    test_all.dependOn(sqlite_step);
 }
 
 fn addTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, spindle: *std.Build.Module) *std.Build.Step.Compile {
@@ -109,4 +138,12 @@ fn addTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, op
     });
     tests.root_module.addImport("spindle", spindle);
     return tests;
+}
+
+fn configureSqlite(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const dependency = b.lazyDependency("sqlite_amalgamation", .{}) orelse @panic("SQLite dependency is required by -Dworkflow-sqlite=true");
+    module.addImport("workflow_sqlite_migrations", b.createModule(.{ .root_source_file = b.path("db/migrations/root.zig"), .target = target, .optimize = optimize }));
+    module.addIncludePath(dependency.path("."));
+    module.addCSourceFile(.{ .file = dependency.path("sqlite3.c"), .flags = &.{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_SYNCHRONOUS=3", "-DSQLITE_OMIT_LOAD_EXTENSION" } });
+    module.link_libc = true;
 }

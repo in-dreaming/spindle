@@ -1,5 +1,38 @@
 const std = @import("std");
 const spindle = @import("spindle");
+const checkpoint_workflow = @import("fixtures/checkpoint_workflow.zig");
+
+test "workflow worker checkpoints terminal decision state" {
+    const Event = spindle.workflow.event.Event;
+    const Payload = spindle.workflow.event.Payload;
+    const events = [_]Event{
+        .{ .sequence = 1, .kind = spindle.workflow.event.Kind.started, .utc_ms = 1, .payload = Payload{ .schema = checkpoint_workflow.schema, .bytes = "" } },
+        .{ .sequence = 2, .kind = spindle.workflow.event.Kind.cancellation_requested, .utc_ms = 2, .payload = Payload{ .schema = checkpoint_workflow.schema, .bytes = "" } },
+    };
+    var command_storage: [4]spindle.workflow.command.Command = undefined;
+    const result = try spindle.workflow.worker.processDecisions(checkpoint_workflow.definition, .{ .high = 1, .low = 2 }, "", 0, &events, &command_storage);
+    try std.testing.expectEqual(spindle.workflow.instance.Status.cancelled, result.status);
+    try std.testing.expect(result.optional_snapshot != null);
+    try std.testing.expect(spindle.workflow.snapshot.verify(result.optional_snapshot.?));
+}
+
+test "workflow snapshot tail and full history reach identical output" {
+    const Event = spindle.workflow.event.Event;
+    const payload = spindle.workflow.event.Payload{ .schema = login_workflow.event_schema, .bytes = "" };
+    const history = [_]Event{
+        .{ .sequence = 1, .kind = spindle.workflow.event.Kind.started, .utc_ms = 1, .payload = payload },
+        .{ .sequence = 2, .kind = spindle.workflow.event.Kind.activity_completed, .utc_ms = 2, .payload = payload },
+    };
+    var full_commands: [4]spindle.workflow.command.Command = undefined;
+    const full = try spindle.workflow.worker.processDecisions(login_workflow.definition, .{ .high = 4, .low = 5 }, login_workflow.idle, 0, &history, &full_commands);
+    var tail_commands: [2]spindle.workflow.command.Command = undefined;
+    const tail = try spindle.workflow.worker.processDecisions(login_workflow.definition, .{ .high = 4, .low = 5 }, login_workflow.waiting, 1, history[1..], &tail_commands);
+    try std.testing.expectEqualStrings(full.state, tail.state);
+    try std.testing.expectEqual(full.status, tail.status);
+    try std.testing.expectEqual(full.commands[1].kind, tail.commands[0].kind);
+    try std.testing.expectEqual(full.commands[1].payload.schema, tail.commands[0].payload.schema);
+    try std.testing.expectEqualStrings(full.commands[1].payload.bytes, tail.commands[0].payload.bytes);
+}
 const login_workflow = @import("fixtures/login_workflow.zig");
 
 test "workflow login v3 fixture replays normal reconnect timeout and compensation commands" {

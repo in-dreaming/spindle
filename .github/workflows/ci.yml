@@ -24,28 +24,8 @@ jobs:
             ~/AppData/Local/zig
             .zig-cache
           key: ${{ runner.os }}-zig-0.16.0-${{ hashFiles('build.zig.zon') }}
-      - run: zig build test-all
-
-  postgres:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16.9@sha256:2d2b03e7cbe065b69ce576331b79f7acbc2a9bef864d7399aee8b819f4a5e4b5
-        env:
-          POSTGRES_USER: spindle
-          POSTGRES_PASSWORD: spindle
-          POSTGRES_DB: spindle
-        ports: [5432:5432]
-        options: >-
-          --health-cmd "pg_isready -U spindle -d spindle"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - run: sudo apt-get update && sudo apt-get install -y libpq-dev
-      - run: zig build test-all -Dpostgres=true -Dpostgres-url=postgresql://spindle:spindle@localhost:5432/spindle
+      - run: zig build --fetch=all
+      - run: zig build test-all --system zig-pkg
 
   bench-smoke:
     runs-on: ubuntu-latest

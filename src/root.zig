@@ -18,7 +18,7 @@ pub const ecs = @import("zruntime/ecs/root.zig");
 /// Resource-graph namespace. It has no initialization side effects.
 pub const resource_graph = @import("zruntime/resource_graph/root.zig");
 /// Durable-workflow namespace. It has no initialization side effects.
-pub const workflow = @import("zruntime/workflow/root.zig");
+pub const workflow = if (@import("build_options").workflow) @import("zruntime/workflow/root.zig") else @import("zruntime/workflow/disabled.zig");
 /// std.Io adapter namespace. It has no initialization side effects.
 pub const io_adapter = @import("zruntime/io_adapter/root.zig");
 /// Observability namespace. It has no initialization side effects.
