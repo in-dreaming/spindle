@@ -114,3 +114,72 @@ test "mpmc queue conserves bounded concurrent values" {
     try std.testing.expectEqual(total, consumed.load(.acquire));
     for (seen) |entry| try std.testing.expect(entry.load(.acquire));
 }
+
+const ShutdownRaceProbe = struct {
+    ran: *std.atomic.Value(u32),
+    fn run(task: *spindle.executor.Task) void {
+        const self: *ShutdownRaceProbe = @ptrCast(@alignCast(task.context.?));
+        _ = self.ran.fetchAdd(1, .acq_rel);
+    }
+};
+
+const ShutdownSubmitter = struct {
+    executor: *spindle.executor.WorkStealingExecutor,
+    tasks: []spindle.executor.Task,
+    started: *spindle.sync.Semaphore,
+    seed: u64,
+    fn run(self: @This()) void {
+        self.started.release(1) catch return;
+        var prng = std.Random.DefaultPrng.init(self.seed);
+        const random = prng.random();
+        for (self.tasks) |*task| {
+            _ = self.executor.submit(task, .{}) catch {};
+            for (0..random.uintLessThan(u8, 3)) |_| std.atomic.spinLoopHint();
+        }
+    }
+};
+
+const ShutdownRaceRun = struct {
+    allocator: std.mem.Allocator,
+    iterations: u32,
+    seed: u64,
+    done: *spindle.sync.Event,
+    result: *std.atomic.Value(bool),
+    fn run(self: @This()) void {
+        defer self.done.set();
+        var prng = std.Random.DefaultPrng.init(self.seed);
+        const random = prng.random();
+        for (0..self.iterations) |iteration| {
+            var executor = spindle.executor.WorkStealingExecutor.init(self.allocator, .{ .workers = 2, .local_capacity = 8, .injection_capacity = 32, .urgent_capacity = 4 }) catch return;
+            defer executor.deinit();
+            var ran: std.atomic.Value(u32) = .init(0);
+            var probe = ShutdownRaceProbe{ .ran = &ran };
+            var tasks: [48]spindle.executor.Task = undefined;
+            for (&tasks) |*task| task.* = spindle.executor.Task.init(ShutdownRaceProbe.run, &probe);
+            var started = spindle.sync.Semaphore.init(0, 1) catch return;
+            const submitter = spindle.platform.thread.spawn(.{}, ShutdownSubmitter.run, .{ShutdownSubmitter{ .executor = &executor, .tasks = &tasks, .started = &started, .seed = random.int(u64) }}) catch return;
+            started.acquire(spindle.platform.park.deadlineAfter(std.time.ns_per_s), .{}) catch return;
+            if (iteration % 2 == 0) std.Thread.yield() catch {};
+            executor.shutdown(.cancel_pending);
+            submitter.join();
+            for (&tasks) |*task| {
+                if (task.queue_references.load(.acquire) != 0) return;
+                switch (task.status()) {
+                    .created, .completed, .cancelled => {},
+                    else => return,
+                }
+            }
+        }
+        self.result.store(true, .release);
+    }
+};
+
+test "work-stealing submit shutdown race is bounded and releases every queue reference" {
+    const seed: u64 = 0x5a17_05e5_d00d_cafe;
+    var done = spindle.sync.Event.init(.manual, false);
+    var passed: std.atomic.Value(bool) = .init(false);
+    const runner = try spindle.platform.thread.spawn(.{}, ShutdownRaceRun.run, .{ShutdownRaceRun{ .allocator = std.testing.allocator, .iterations = @min(build_options.iterations, 64), .seed = seed, .done = &done, .result = &passed }});
+    try done.wait(spindle.platform.park.deadlineAfter(5 * std.time.ns_per_s), .{});
+    runner.join();
+    try std.testing.expect(passed.load(.acquire));
+}

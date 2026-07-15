@@ -86,8 +86,8 @@ pub const FixedPool = struct {
     pub fn isWorkerThread(self: *const FixedPool) bool {
         return worker_state == @as(*anyopaque, @ptrCast(self.state));
     }
-    pub fn helpUntil(self: *FixedPool, predicate: *const fn () bool) void {
-        while (!predicate()) {
+    pub fn helpUntil(self: *FixedPool, context: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
+        while (!predicate(context)) {
             const task = self.state.queue.tryPop() catch {
                 std.Thread.yield() catch {};
                 continue;
@@ -127,8 +127,8 @@ pub const FixedPool = struct {
         const self: *FixedPool = @ptrCast(@alignCast(context));
         return self.isWorkerThread();
     }
-    fn erasedHelp(context: *anyopaque, predicate: *const fn () bool) void {
+    fn erasedHelp(context: *anyopaque, predicate_context: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
         const self: *FixedPool = @ptrCast(@alignCast(context));
-        self.helpUntil(predicate);
+        self.helpUntil(predicate_context, predicate);
     }
 };

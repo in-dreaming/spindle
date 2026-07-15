@@ -36,8 +36,12 @@ pub const Scope = struct {
         };
     }
     pub fn wait(self: *Scope) !void {
-        try self.counter.wait();
+        if (self.executor.isWorkerThread()) self.executor.helpUntil(self, isComplete) else try self.counter.wait();
         if (self.policy != .ignore_errors and self.failed) return error.TaskFailed;
+    }
+    fn isComplete(context: *anyopaque) bool {
+        const self: *Scope = @ptrCast(@alignCast(context));
+        return self.counter.isComplete();
     }
     pub fn cancel(self: *Scope) void {
         self.cancellation.cancel();

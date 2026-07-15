@@ -80,8 +80,8 @@ pub const PumpExecutor = struct {
     fn worker(_: *anyopaque) bool {
         return false;
     }
-    fn help(context: *anyopaque, predicate: *const fn () bool) void {
+    fn help(context: *anyopaque, predicate_context: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
         const self: *PumpExecutor = @ptrCast(@alignCast(context));
-        while (!predicate() and self.drain(1) != 0) {}
+        while (!predicate(predicate_context) and self.drain(1) != 0) {}
     }
 };

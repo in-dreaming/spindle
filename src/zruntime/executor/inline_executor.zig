@@ -24,7 +24,7 @@ pub const InlineExecutor = struct {
     fn worker(_: *anyopaque) bool {
         return true;
     }
-    fn help(_: *anyopaque, predicate: *const fn () bool) void {
-        _ = predicate();
+    fn help(_: *anyopaque, context: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
+        _ = predicate(context);
     }
 };

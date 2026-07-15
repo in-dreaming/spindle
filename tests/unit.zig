@@ -343,3 +343,88 @@ test "fixed pool identifies its own worker thread" {
     try task.wait();
     try std.testing.expect(observed.load(.acquire));
 }
+
+const WorkStealingSpawnProbe = struct {
+    executor: *spindle.executor.WorkStealingExecutor,
+    children: []spindle.executor.Task,
+    value: *std.atomic.Value(u32),
+    fn parent(task: *spindle.executor.Task) void {
+        const self: *WorkStealingSpawnProbe = @ptrCast(@alignCast(task.context.?));
+        for (self.children) |*child_task| self.executor.submit(child_task, .{}) catch @panic("work-stealing submission failed");
+    }
+    fn child(task: *spindle.executor.Task) void {
+        const self: *WorkStealingSpawnProbe = @ptrCast(@alignCast(task.context.?));
+        _ = self.value.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "work-stealing executor runs local overflow through bounded injection and joins workers" {
+    var executor = try spindle.executor.WorkStealingExecutor.init(std.testing.allocator, .{ .workers = 2, .local_capacity = 2, .injection_capacity = 16, .urgent_capacity = 2 });
+    defer executor.deinit();
+    var value: std.atomic.Value(u32) = .init(0);
+    var children: [6]spindle.executor.Task = undefined;
+    var probe = WorkStealingSpawnProbe{ .executor = &executor, .children = &children, .value = &value };
+    for (&children) |*child| child.* = spindle.executor.Task.init(WorkStealingSpawnProbe.child, &probe);
+    var parent = spindle.executor.Task.init(WorkStealingSpawnProbe.parent, &probe);
+    try executor.submit(&parent, .{});
+    try parent.wait();
+    for (&children) |*child| try child.wait();
+    try std.testing.expectEqual(@as(u32, 6), value.load(.acquire));
+}
+
+test "deterministic executor replay rejects mismatched task identities" {
+    var recorded = spindle.executor.DeterministicExecutor.init(std.testing.allocator);
+    defer recorded.deinit();
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var task = spindle.executor.Task.init(TaskProbe.run, &probe);
+    try recorded.submitWithId(&task, 42);
+    try recorded.run();
+    var log = try recorded.recordLog();
+    defer log.deinit(std.testing.allocator);
+    var replay = try spindle.executor.DeterministicExecutor.initReplay(std.testing.allocator, &log);
+    defer replay.deinit();
+    var divergent = spindle.executor.Task.init(TaskProbe.run, &probe);
+    try std.testing.expectError(error.ReplayMismatch, replay.submitWithId(&divergent, 7));
+}
+
+const PriorityProbe = struct {
+    executor: *spindle.executor.WorkStealingExecutor,
+    high: []spindle.executor.Task,
+    background: *spindle.executor.Task,
+    high_done: *std.atomic.Value(u32),
+    background_observed: *std.atomic.Value(u32),
+    fn parent(task: *spindle.executor.Task) void {
+        const self: *PriorityProbe = @ptrCast(@alignCast(task.context.?));
+        self.executor.submit(self.background, .{}) catch @panic("background submission failed");
+        for (self.high) |*high_task| self.executor.submit(high_task, .{}) catch @panic("high submission failed");
+    }
+    fn highTask(task: *spindle.executor.Task) void {
+        const self: *PriorityProbe = @ptrCast(@alignCast(task.context.?));
+        _ = self.high_done.fetchAdd(1, .acq_rel);
+    }
+    fn backgroundTask(task: *spindle.executor.Task) void {
+        const self: *PriorityProbe = @ptrCast(@alignCast(task.context.?));
+        self.background_observed.store(self.high_done.load(.acquire), .release);
+    }
+};
+
+test "work-stealing priority aging bounds background starvation" {
+    var executor = try spindle.executor.WorkStealingExecutor.init(std.testing.allocator, .{ .workers = 1, .local_capacity = 64, .injection_capacity = 64, .urgent_capacity = 2, .high_skip_limit = 3, .normal_skip_limit = 5 });
+    defer executor.deinit();
+    var high_done: std.atomic.Value(u32) = .init(0);
+    var background_observed: std.atomic.Value(u32) = .init(99);
+    var high: [12]spindle.executor.Task = undefined;
+    var background = spindle.executor.Task.init(PriorityProbe.backgroundTask, null);
+    var probe = PriorityProbe{ .executor = &executor, .high = &high, .background = &background, .high_done = &high_done, .background_observed = &background_observed };
+    background.context = &probe;
+    background.priority = .low;
+    for (&high) |*high_task| {
+        high_task.* = spindle.executor.Task.init(PriorityProbe.highTask, &probe);
+        high_task.priority = .high;
+    }
+    var parent = spindle.executor.Task.init(PriorityProbe.parent, &probe);
+    try executor.submit(&parent, .{});
+    try background.wait();
+    try std.testing.expect(background_observed.load(.acquire) <= 5);
+}

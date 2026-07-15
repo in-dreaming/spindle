@@ -57,7 +57,7 @@ pub const Executor = struct {
     submit_fn: *const fn (*anyopaque, *Task, SubmitOptions) SubmitError!void,
     worker_count_fn: *const fn (*anyopaque) usize,
     is_worker_fn: *const fn (*anyopaque) bool,
-    help_until_fn: *const fn (*anyopaque, *const fn () bool) void,
+    help_until_fn: *const fn (*anyopaque, *anyopaque, *const fn (*anyopaque) bool) void,
     pub fn submit(self: Executor, task: *Task, options: SubmitOptions) SubmitError!void {
         try self.submit_fn(self.context, task, options);
     }
@@ -67,7 +67,7 @@ pub const Executor = struct {
     pub fn isWorkerThread(self: Executor) bool {
         return self.is_worker_fn(self.context);
     }
-    pub fn helpUntil(self: Executor, predicate: *const fn () bool) void {
-        self.help_until_fn(self.context, predicate);
+    pub fn helpUntil(self: Executor, context: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
+        self.help_until_fn(self.context, context, predicate);
     }
 };
