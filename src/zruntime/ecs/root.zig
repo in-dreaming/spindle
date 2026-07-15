@@ -1,4 +1,5 @@
 /// Generational entity handles and locations.
+pub const unavailable = false;
 pub const entity = @import("entity.zig");
 /// Stable component metadata registry.
 pub const component_registry = @import("component_registry.zig");

@@ -1,4 +1,5 @@
 /// One-shot in-process directed acyclic task graphs.
+pub const unavailable = false;
 pub const node = @import("node.zig");
 pub const LocalTaskGraph = @import("builder.zig").LocalTaskGraph;
 pub const CompiledLocalTaskGraph = @import("compiled_graph.zig").CompiledLocalTaskGraph;

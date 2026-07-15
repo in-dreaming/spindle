@@ -21,10 +21,8 @@ pub const Clock = struct {
 
 /// Production clock backed by the operating system. It is safe for concurrent reads.
 pub const SystemClock = struct {
-    timer: std.time.Timer,
-
     pub fn init() !SystemClock {
-        return .{ .timer = try std.time.Timer.start() };
+        return .{};
     }
 
     pub fn clock(self: *SystemClock) Clock {
@@ -32,12 +30,12 @@ pub const SystemClock = struct {
     }
 
     fn monotonicNow(ptr: *anyopaque) u64 {
-        const self: *SystemClock = @ptrCast(@alignCast(ptr));
-        return self.timer.read();
+        _ = ptr;
+        return @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds);
     }
 
     fn utcNow(_: *anyopaque) i64 {
-        return std.time.milliTimestamp();
+        return @intCast(@divTrunc(std.Io.Clock.real.now(std.Options.debug_io).nanoseconds, std.time.ns_per_ms));
     }
 };
 

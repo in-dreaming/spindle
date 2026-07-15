@@ -4,17 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const stress_iterations = b.option(u32, "stress-iterations", "Iterations used by bounded stress tests") orelse 128;
+    const task_graph_enabled = b.option(bool, "task-graph", "Build the local task graph") orelse true;
+    const ecs_enabled = b.option(bool, "ecs", "Build ECS storage and scheduling") orelse false;
+    const resource_graph_enabled = b.option(bool, "resource-graph", "Build the resource graph") orelse false;
     const workflow_enabled = b.option(bool, "workflow", "Build the database-independent workflow protocol") orelse true;
     const workflow_sqlite_enabled = b.option(bool, "workflow-sqlite", "Build the embedded SQLite workflow store") orelse false;
     const workflow_archive_enabled = b.option(bool, "workflow-archive", "Build local workflow history archival") orelse false;
     const workflow_archive_http_enabled = b.option(bool, "workflow-archive-http", "Build HTTP workflow archive transport") orelse false;
+    if (resource_graph_enabled and !task_graph_enabled) @panic("-Dresource-graph=true implies -Dtask-graph=true");
     if (workflow_sqlite_enabled and !workflow_enabled) {
         @panic("-Dworkflow-sqlite=true implies -Dworkflow=true; do not disable workflow");
     }
     if (workflow_archive_enabled and !workflow_sqlite_enabled) @panic("-Dworkflow-archive=true implies -Dworkflow-sqlite=true");
     if (workflow_archive_http_enabled and !workflow_archive_enabled) @panic("-Dworkflow-archive-http=true implies -Dworkflow-archive=true");
+    if (workflow_archive_http_enabled and !resource_graph_enabled) @panic("-Dworkflow-archive-http=true implies -Dresource-graph=true");
 
     const base_options = b.addOptions();
+    base_options.addOption(bool, "task_graph", task_graph_enabled);
+    base_options.addOption(bool, "ecs", ecs_enabled);
+    base_options.addOption(bool, "resource_graph", resource_graph_enabled);
     base_options.addOption(bool, "workflow", workflow_enabled);
     base_options.addOption(bool, "workflow_sqlite", workflow_sqlite_enabled);
     base_options.addOption(bool, "workflow_archive", workflow_archive_enabled);
@@ -48,11 +56,16 @@ pub fn build(b: *std.Build) void {
     const check = b.step("check", "Compile the public library and smoke example");
     check.dependOn(&library.step);
     check.dependOn(&smoke.step);
+    addProfileExamples(b, check, target, optimize, spindle, task_graph_enabled, ecs_enabled, resource_graph_enabled);
 
-    const unit_tests = addTest(b, "tests/unit.zig", target, optimize, spindle);
-    const integration_tests = addTest(b, "tests/integration/root.zig", target, optimize, spindle);
-    const recovery_tests = addTest(b, "tests/integration/resource_recovery.zig", target, optimize, spindle);
-    const artifact_http_tests = addTest(b, "tests/integration/artifact_http.zig", target, optimize, spindle);
+    const model_options = featureOptions(b, true, true, true, true, false, false, false);
+    const model_module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    model_module.addOptions("build_options", model_options);
+    const unit_tests = addTest(b, "tests/unit.zig", target, optimize, model_module);
+    const integration_tests = addTest(b, "tests/integration/root.zig", target, optimize, model_module);
+    const runtime_tests = addTest(b, "tests/integration/runtime_integration.zig", target, optimize, spindle);
+    const recovery_tests = addTest(b, "tests/integration/resource_recovery.zig", target, optimize, model_module);
+    const artifact_http_tests = addTest(b, "tests/integration/artifact_http.zig", target, optimize, model_module);
     const artifact_server_options = b.addOptions();
     artifact_server_options.addOption([]const u8, "server_script", b.pathFromRoot("tests/fixtures/artifact_http_server.ps1"));
     artifact_http_tests.root_module.addOptions("build_options", artifact_server_options);
@@ -63,6 +76,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and non-external-service integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&b.addRunArtifact(runtime_tests).step);
     test_step.dependOn(&run_recovery_tests.step);
     test_step.dependOn(&run_artifact_http_tests.step);
 
@@ -98,6 +112,9 @@ pub fn build(b: *std.Build) void {
 
     const sqlite_step = b.step("test-sqlite", "Run real SQLite workflow persistence tests");
     const sqlite_options = b.addOptions();
+    sqlite_options.addOption(bool, "task_graph", true);
+    sqlite_options.addOption(bool, "ecs", false);
+    sqlite_options.addOption(bool, "resource_graph", false);
     sqlite_options.addOption(bool, "workflow", true);
     sqlite_options.addOption(bool, "workflow_sqlite", true);
     sqlite_options.addOption(bool, "workflow_archive", false);
@@ -120,6 +137,9 @@ pub fn build(b: *std.Build) void {
     const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
     sqlite_step.dependOn(&run_sqlite_tests.step);
     const archive_options = b.addOptions();
+    archive_options.addOption(bool, "task_graph", true);
+    archive_options.addOption(bool, "ecs", false);
+    archive_options.addOption(bool, "resource_graph", false);
     archive_options.addOption(bool, "workflow", true);
     archive_options.addOption(bool, "workflow_sqlite", true);
     archive_options.addOption(bool, "workflow_archive", true);
@@ -133,6 +153,9 @@ pub fn build(b: *std.Build) void {
     archive_tests.root_module.addImport("login_workflow", archive_login_fixture);
     sqlite_step.dependOn(&b.addRunArtifact(archive_tests).step);
     const archive_http_options = b.addOptions();
+    archive_http_options.addOption(bool, "task_graph", true);
+    archive_http_options.addOption(bool, "ecs", false);
+    archive_http_options.addOption(bool, "resource_graph", true);
     archive_http_options.addOption(bool, "workflow", true);
     archive_http_options.addOption(bool, "workflow_sqlite", true);
     archive_http_options.addOption(bool, "workflow_archive", true);
@@ -143,6 +166,9 @@ pub fn build(b: *std.Build) void {
     const archive_http_tests = addTest(b, "tests/integration/workflow_archive_http_feature.zig", target, optimize, archive_http_module);
     sqlite_step.dependOn(&b.addRunArtifact(archive_http_tests).step);
     const workflow_off_options = b.addOptions();
+    workflow_off_options.addOption(bool, "task_graph", true);
+    workflow_off_options.addOption(bool, "ecs", false);
+    workflow_off_options.addOption(bool, "resource_graph", false);
     workflow_off_options.addOption(bool, "workflow", false);
     workflow_off_options.addOption(bool, "workflow_sqlite", false);
     workflow_off_options.addOption(bool, "workflow_archive", false);
@@ -159,6 +185,51 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(test_step);
     test_all.dependOn(stress_step);
     test_all.dependOn(sqlite_step);
+
+    const matrix_step = b.step("test-feature-matrix", "Compile supported feature profiles and inspect optional imports");
+    const profiles = [_]struct { name: []const u8, task_graph: bool, ecs: bool, resource_graph: bool, workflow: bool, sqlite: bool, archive: bool, archive_http: bool }{
+        .{ .name = "core", .task_graph = false, .ecs = false, .resource_graph = false, .workflow = false, .sqlite = false, .archive = false, .archive_http = false },
+        .{ .name = "default", .task_graph = true, .ecs = false, .resource_graph = false, .workflow = true, .sqlite = false, .archive = false, .archive_http = false },
+        .{ .name = "models", .task_graph = true, .ecs = true, .resource_graph = true, .workflow = true, .sqlite = false, .archive = false, .archive_http = false },
+        .{ .name = "sqlite", .task_graph = true, .ecs = true, .resource_graph = true, .workflow = true, .sqlite = true, .archive = false, .archive_http = false },
+        .{ .name = "archive_http", .task_graph = true, .ecs = true, .resource_graph = true, .workflow = true, .sqlite = true, .archive = true, .archive_http = true },
+    };
+    for (profiles) |profile| {
+        const options = featureOptions(b, profile.task_graph, profile.ecs, profile.resource_graph, profile.workflow, profile.sqlite, profile.archive, profile.archive_http);
+        const module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+        module.addOptions("build_options", options);
+        if (profile.sqlite) configureSqlite(b, module, target, optimize);
+        const matrix_tests = addTest(b, "tests/integration/feature_matrix.zig", target, optimize, module);
+        matrix_step.dependOn(&b.addRunArtifact(matrix_tests).step);
+        _ = profile.name;
+    }
+    test_all.dependOn(matrix_step);
+}
+
+fn featureOptions(b: *std.Build, task_graph: bool, ecs: bool, resource_graph: bool, workflow: bool, sqlite: bool, archive: bool, archive_http: bool) *std.Build.Step.Options {
+    const options = b.addOptions();
+    options.addOption(bool, "task_graph", task_graph);
+    options.addOption(bool, "ecs", ecs);
+    options.addOption(bool, "resource_graph", resource_graph);
+    options.addOption(bool, "workflow", workflow);
+    options.addOption(bool, "workflow_sqlite", sqlite);
+    options.addOption(bool, "workflow_archive", archive);
+    options.addOption(bool, "workflow_archive_http", archive_http);
+    return options;
+}
+
+fn addProfileExamples(b: *std.Build, check: *std.Build.Step, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, spindle: *std.Build.Module, task_graph_enabled: bool, ecs_enabled: bool, resource_graph_enabled: bool) void {
+    const examples = [_]struct { path: []const u8, enabled: bool }{
+        .{ .path = "examples/executor_parallel.zig", .enabled = true },
+        .{ .path = "examples/local_graph.zig", .enabled = task_graph_enabled },
+        .{ .path = "examples/ecs.zig", .enabled = ecs_enabled },
+        .{ .path = "examples/resource_graph.zig", .enabled = resource_graph_enabled },
+    };
+    for (examples) |example| if (example.enabled) {
+        const executable = b.addExecutable(.{ .name = b.fmt("spindle-{s}", .{std.fs.path.stem(example.path)}), .root_module = b.createModule(.{ .root_source_file = b.path(example.path), .target = target, .optimize = optimize }) });
+        executable.root_module.addImport("spindle", spindle);
+        check.dependOn(&executable.step);
+    };
 }
 
 fn addTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, spindle: *std.Build.Module) *std.Build.Step.Compile {

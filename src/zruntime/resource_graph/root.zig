@@ -1,4 +1,5 @@
 /// Resource identities, access declarations, and compiled hazard plans.
+pub const unavailable = false;
 pub const resource_key = @import("resource_key.zig");
 pub const resource_range = @import("resource_range.zig");
 pub const access = @import("access.zig");

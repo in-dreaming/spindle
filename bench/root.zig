@@ -26,7 +26,9 @@ const Probe = struct {
 
 pub fn main() void {
     const allocator = std.heap.page_allocator;
-    runEcsScheduler(allocator);
+    runWorkload(allocator, 10_000);
+    runParallelFor(allocator);
+    if (comptime spindle.runtime.Features.ecs) runEcsScheduler(allocator);
 }
 
 const ParallelBench = struct {

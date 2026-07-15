@@ -1,4 +1,5 @@
 /// Durable workflow protocol and deterministic replay. It performs no I/O or background work.
+pub const unavailable = false;
 pub const definition = @import("definition.zig");
 pub const instance = @import("instance.zig");
 pub const event = @import("event.zig");

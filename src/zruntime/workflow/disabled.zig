@@ -1,1 +1,2 @@
-// Empty feature stub. Durable workflow APIs are unavailable without -Dworkflow=true.
+/// Compile-time marker for the omitted workflow protocol.
+pub const unavailable = true;
