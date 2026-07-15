@@ -49,3 +49,16 @@ pub fn eql(left: Command, right: Command) bool {
         left.payload.schema.id == right.payload.schema.id and left.payload.schema.version == right.payload.schema.version and
         std.mem.eql(u8, left.payload.bytes, right.payload.bytes);
 }
+
+/// Encodes a durable timer delay followed by its application payload in fixed network byte order.
+pub fn encodeTimer(comptime payload: []const u8, delay_ms: u64) [8 + payload.len]u8 {
+    var result: [8 + payload.len]u8 = undefined;
+    std.mem.writeInt(u64, result[0..8], delay_ms, .big);
+    @memcpy(result[8..], payload);
+    return result;
+}
+pub const DecodedTimer = struct { delay_ms: u64, payload: []const u8 };
+pub fn decodeTimer(bytes: []const u8) error{InvalidTimerCommand}!DecodedTimer {
+    if (bytes.len < 8) return error.InvalidTimerCommand;
+    return .{ .delay_ms = std.mem.readInt(u64, bytes[0..8], .big), .payload = bytes[8..] };
+}

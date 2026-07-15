@@ -27,9 +27,9 @@ pub const Worker = struct {
                 try self.store.blockWorkflowTask(claim);
                 return err;
             };
-            var scheduled = try worker.normalizeCommands(self.allocator, claim.workflow_id, transition.commands);
-            defer worker.deinitScheduledWork(self.allocator, &scheduled);
             const utc_ms = self.store.clock.utcNow();
+            var scheduled = try worker.normalizeCommands(self.allocator, claim.workflow_id, transition.last_decision_sequence, utc_ms, transition.commands);
+            defer worker.deinitScheduledWork(self.allocator, &scheduled);
             try self.store.commitWorkflowTaskTransition(.{
                 .claim = claim,
                 .tenant = loaded.tenant,

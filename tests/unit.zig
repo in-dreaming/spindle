@@ -29,9 +29,9 @@ test "workflow snapshot tail and full history reach identical output" {
     const tail = try spindle.workflow.worker.processDecisions(login_workflow.definition, .{ .high = 4, .low = 5 }, login_workflow.waiting, 1, history[1..], &tail_commands);
     try std.testing.expectEqualStrings(full.state, tail.state);
     try std.testing.expectEqual(full.status, tail.status);
-    try std.testing.expectEqual(full.commands[1].kind, tail.commands[0].kind);
-    try std.testing.expectEqual(full.commands[1].payload.schema, tail.commands[0].payload.schema);
-    try std.testing.expectEqualStrings(full.commands[1].payload.bytes, tail.commands[0].payload.bytes);
+    try std.testing.expectEqual(full.commands[3].kind, tail.commands[0].kind);
+    try std.testing.expectEqual(full.commands[3].payload.schema, tail.commands[0].payload.schema);
+    try std.testing.expectEqualStrings(full.commands[3].payload.bytes, tail.commands[0].payload.bytes);
 }
 const login_workflow = @import("fixtures/login_workflow.zig");
 
@@ -46,7 +46,11 @@ test "workflow login v3 fixture replays normal reconnect timeout and compensatio
         .{ .sequence = 2, .kind = workflow.event.Kind.activity_completed, .utc_ms = 101, .payload = empty },
     };
     const recorded = [_]workflow.replay.CommandEvent{
-        .{ .input_sequence = 1, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.schedule_activity, .payload = .{ .schema = login_workflow.command_schema, .bytes = "authenticate" } }} },
+        .{ .input_sequence = 1, .commands = &.{
+            .{ .sequence = 1, .kind = workflow.command.Kind.schedule_activity, .payload = .{ .schema = login_workflow.command_schema, .bytes = "authenticate" } },
+            .{ .sequence = 2, .kind = workflow.command.Kind.schedule_timer, .payload = .{ .schema = login_workflow.event_schema, .bytes = &login_workflow.timer_command } },
+            .{ .sequence = 3, .kind = workflow.command.Kind.send_signal, .payload = .{ .schema = login_workflow.event_schema, .bytes = "login-notify" } },
+        } },
         .{ .input_sequence = 2, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.complete, .payload = .{ .schema = login_workflow.command_schema, .bytes = "logged-in" } }} },
     };
     var storage: [4]commands = undefined;
@@ -86,7 +90,7 @@ test "workflow verifier detects command mutation and retry is deterministic" {
     const Command = workflow.command.Command;
     const history = [_]Event{.{ .sequence = 1, .kind = workflow.event.Kind.started, .utc_ms = 0, .payload = Payload{ .schema = login_workflow.event_schema, .bytes = "" } }};
     const mutated = [_]workflow.replay.CommandEvent{.{ .input_sequence = 1, .commands = &.{.{ .sequence = 1, .kind = workflow.command.Kind.complete, .payload = .{ .schema = login_workflow.command_schema, .bytes = "wrong" } }} }};
-    var storage: [2]Command = undefined;
+    var storage: [4]Command = undefined;
     try std.testing.expectError(error.CommandMismatch, workflow.replay.verify(login_workflow.definition, login_workflow.idle, null, &history, &mutated, &storage, &.{}));
     const policy = workflow.retry.Policy{ .initial_backoff_ms = 10, .max_backoff_ms = 25, .max_attempts = 3, .jitter_percent = 20, .non_retryable = &.{9} };
     try std.testing.expectEqual(workflow.retry.delayMs(policy, 3, 17), workflow.retry.delayMs(policy, 3, 17));

@@ -10,6 +10,7 @@ pub const idle = "idle";
 pub const waiting = "waiting";
 pub const authenticated = "authenticated";
 pub const timed_out = "timed_out";
+pub const timer_command = spindle.workflow.command.encodeTimer("login-timeout", 100);
 
 /// The v3 login fixture has no external effects; emitted commands are its golden protocol output.
 pub fn transition(context: *spindle.workflow.definition.WorkflowContext, state: []const u8, input: spindle.workflow.event.Event) !spindle.workflow.definition.Outcome {
@@ -17,6 +18,8 @@ pub fn transition(context: *spindle.workflow.definition.WorkflowContext, state: 
     switch (input.kind) {
         spindle.workflow.event.Kind.started => {
             try context.commands.emit(spindle.workflow.command.Kind.schedule_activity, .{ .schema = command_schema, .bytes = "authenticate" });
+            try context.commands.emit(spindle.workflow.command.Kind.schedule_timer, .{ .schema = event_schema, .bytes = &timer_command });
+            try context.commands.emit(spindle.workflow.command.Kind.send_signal, .{ .schema = event_schema, .bytes = "login-notify" });
             return .{ .new_state = waiting };
         },
         spindle.workflow.event.Kind.activity_completed => {

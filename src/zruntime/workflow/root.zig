@@ -19,6 +19,10 @@ pub const client = if (build_options.workflow_sqlite) @import("client.zig") else
 pub const scheduler = if (build_options.workflow_sqlite) @import("scheduler.zig") else @import("scheduler_disabled.zig");
 pub const sqlite_worker = if (build_options.workflow_sqlite) @import("sqlite_worker.zig") else @import("sqlite_worker_disabled.zig");
 pub const sqlite_runtime = if (build_options.workflow_sqlite) @import("sqlite_runtime.zig") else @import("sqlite_runtime_disabled.zig");
+/// SQLite activity delivery is omitted from core-only builds.
+pub const activity_worker = if (build_options.workflow_sqlite) @import("activity_worker.zig") else struct {};
+pub const timer_worker = if (build_options.workflow_sqlite) @import("timer_worker.zig") else struct {};
+pub const outbox = if (build_options.workflow_sqlite) @import("outbox.zig") else struct {};
 pub const WorkflowId = instance.WorkflowId;
 pub const Definition = definition.Definition;
 pub const Registry = definition.Registry;

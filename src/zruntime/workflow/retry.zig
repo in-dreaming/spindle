@@ -2,13 +2,7 @@ const std = @import("std");
 const activity = @import("activity.zig");
 
 /// Pure retry policy. Jitter is deterministic and its selected delay belongs in command metadata.
-pub const Policy = struct {
-    initial_backoff_ms: u64,
-    max_backoff_ms: u64,
-    max_attempts: u32,
-    jitter_percent: u8 = 0,
-    non_retryable: []const u32 = &.{},
-};
+pub const Policy = activity.RetryPolicy;
 
 pub fn shouldRetry(policy: Policy, attempt: u32, failure: activity.Failure) bool {
     if (attempt >= policy.max_attempts or failure.kind == .non_retryable) return false;

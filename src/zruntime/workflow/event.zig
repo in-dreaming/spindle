@@ -11,6 +11,8 @@ pub const Kind = struct {
     pub const command_recorded: u32 = 6;
     pub const random_recorded: u32 = 7;
     pub const cancellation_requested: u32 = 8;
+    /// A deterministic retry decision. It is replay metadata, not workflow input.
+    pub const activity_retry_scheduled: u32 = 9;
 };
 
 /// A schema-qualified payload which aliases caller-owned immutable bytes.

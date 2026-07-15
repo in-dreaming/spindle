@@ -14,6 +14,9 @@ pub const max_payload_bytes: usize = 1024 * 1024;
 pub const Error = error{ WorkflowStoreInUse, MigrationMismatch, CorruptSchema, PayloadTooLarge, IdempotencyConflict, NotFound, StaleRuntimeEpoch, Conflict, DatabaseBusy, DatabaseFull, DatabaseIo, DatabaseFailure };
 pub const InstanceRecord = struct { id: core.StableId, definition_id: u64, definition_version: u32, status: instance.Status, state_version: u64, state: []u8 };
 pub const Claim = struct { task_id: core.StableId, workflow_id: core.StableId, state_version: u64, definition_id: u64, definition_version: u32, runtime_epoch: u64 };
+pub const ActivityClaim = struct { allocator: std.mem.Allocator, task_id: core.StableId, workflow_id: core.StableId, command_sequence: u64, attempt: u32, runtime_epoch: u64, scheduled_utc_ms: i64, started_utc_ms: i64, payload: []u8, schema: core.schema.SchemaKey };
+pub const TimerClaim = struct { allocator: std.mem.Allocator, timer_id: core.StableId, workflow_id: core.StableId, runtime_epoch: u64, payload: []u8, schema: core.schema.SchemaKey };
+pub const OutboxClaim = struct { allocator: std.mem.Allocator, message_id: core.StableId, workflow_id: core.StableId, runtime_epoch: u64, payload: []u8 };
 pub const LoadedTask = struct {
     allocator: std.mem.Allocator,
     claim: Claim,
@@ -43,6 +46,7 @@ pub const Commit = struct {
     updated_utc_ms: i64,
 };
 const migration_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v1;
+const migration_v2_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v2;
 
 /// One SQLite connection, serialized by this store. It owns the process-local SQLite store lock.
 pub const Store = struct {
@@ -212,6 +216,154 @@ pub const Store = struct {
         if (!try self.step(stmt)) return error.NotFound;
         const state = self.allocator.dupe(u8, self.columnBlob(stmt, 4)) catch return error.DatabaseFailure;
         return .{ .id = id, .definition_id = @intCast(self.columnInt(stmt, 0)), .definition_version = @intCast(self.columnInt(stmt, 1)), .status = parseStatus(self.columnText(stmt, 2)), .state_version = @intCast(self.columnInt(stmt, 3)), .state = state };
+    }
+
+    /// Claims at most one activity for this runtime epoch. The returned payload is caller-owned.
+    pub fn claimActivity(self: *Store, allocator: std.mem.Allocator, tenant: []const u8, namespace: []const u8) (Error || std.mem.Allocator.Error)!?ActivityClaim {
+        if (!self.onDispatcher()) return self.invoke(Store.claimActivity, .{ allocator, tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        const s = try self.prepare("UPDATE activity_task SET status_v2='claimed',claimed_epoch=?1,attempt=attempt+1,started_utc_ms=?4,heartbeat_utc_ms=?4 WHERE task_id=(SELECT task_id FROM activity_task WHERE tenant=?2 AND namespace=?3 AND ((status_v2='ready' AND available_utc_ms<=?4) OR (status_v2='claimed' AND claimed_epoch<>?1)) ORDER BY available_utc_ms,task_id LIMIT 1) RETURNING task_id,workflow_id,command_sequence,attempt,scheduled_utc_ms,started_utc_ms,payload,schema_id,schema_version;");
+        defer self.finalize(s);
+        try self.bindInt(s, 1, self.runtime_epoch);
+        try self.bindText(s, 2, tenant);
+        try self.bindText(s, 3, namespace);
+        try self.bindInt(s, 4, self.clock.utcNow());
+        if (!try self.step(s)) {
+            try self.commit();
+            return null;
+        }
+        const result = ActivityClaim{ .allocator = allocator, .task_id = self.columnId(s, 0), .workflow_id = self.columnId(s, 1), .command_sequence = @intCast(self.columnInt(s, 2)), .attempt = @intCast(self.columnInt(s, 3)), .runtime_epoch = self.runtime_epoch, .scheduled_utc_ms = self.columnInt(s, 4), .started_utc_ms = self.columnInt(s, 5), .payload = try allocator.dupe(u8, self.columnBlob(s, 6)), .schema = .{ .id = @bitCast(self.columnInt(s, 7)), .version = @intCast(self.columnInt(s, 8)) } };
+        _ = try self.step(s);
+        try self.commit();
+        return result;
+    }
+    /// Atomically records an activity result, wakes its workflow, and fences stale runtimes.
+    pub fn finishActivity(self: *Store, claim: ActivityClaim, tenant: []const u8, namespace: []const u8, kind: u32, schema: core.schema.SchemaKey, payload: []const u8) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.finishActivity, .{ claim, tenant, namespace, kind, schema, payload });
+        defer claim.allocator.free(claim.payload);
+        try self.finishExternal("activity_task", "task_id", claim.task_id, claim.workflow_id, claim.runtime_epoch, tenant, namespace, kind, schema, payload);
+    }
+    pub fn heartbeatActivity(self: *Store, claim: ActivityClaim) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.heartbeatActivity, .{claim});
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const s = try self.prepare("UPDATE activity_task SET heartbeat_utc_ms=?3 WHERE task_id=?1 AND status_v2='claimed' AND claimed_epoch=?2;");
+        defer self.finalize(s);
+        try self.bindId(s, 1, claim.task_id);
+        try self.bindInt(s, 2, claim.runtime_epoch);
+        try self.bindInt(s, 3, self.clock.utcNow());
+        _ = try self.step(s);
+        if (c.sqlite3_changes(self.db) != 1) return error.StaleRuntimeEpoch;
+    }
+    /// Persists a deterministic retry decision and releases the claim in one transaction.
+    pub fn retryActivity(self: *Store, claim: ActivityClaim, tenant: []const u8, namespace: []const u8, delay_ms: u64) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.retryActivity, .{ claim, tenant, namespace, delay_ms });
+        defer claim.allocator.free(claim.payload);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.metadataU64("runtime_epoch") != claim.runtime_epoch) return error.StaleRuntimeEpoch;
+        const now = self.clock.utcNow();
+        const release = try self.prepare("UPDATE activity_task SET status_v2='ready',claimed_epoch=NULL,available_utc_ms=?3 WHERE task_id=?1 AND status_v2='claimed' AND claimed_epoch=?2;");
+        defer self.finalize(release);
+        try self.bindId(release, 1, claim.task_id);
+        try self.bindInt(release, 2, claim.runtime_epoch);
+        try self.bindInt(release, 3, now + @as(i64, @intCast(delay_ms)));
+        _ = try self.step(release);
+        if (c.sqlite3_changes(self.db) != 1) return error.StaleRuntimeEpoch;
+        var retry_metadata: [12]u8 = undefined;
+        std.mem.writeInt(u32, retry_metadata[0..4], claim.attempt, .big);
+        std.mem.writeInt(u64, retry_metadata[4..12], delay_ms, .big);
+        try self.appendHistoryFact(tenant, namespace, claim.workflow_id, derivedEventId(claim.task_id, @intCast(claim.attempt)), event.Kind.activity_retry_scheduled, .{ .id = 0x6163_7469_7669_7479, .version = 1 }, &retry_metadata, now);
+        try self.commit();
+    }
+    pub fn activityCancelled(self: *Store, claim: ActivityClaim, tenant: []const u8, namespace: []const u8) Error!bool {
+        if (!self.onDispatcher()) return self.invoke(Store.activityCancelled, .{ claim, tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const s = try self.prepare("SELECT 1 FROM workflow_history WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND kind=?4 LIMIT 1;");
+        defer self.finalize(s);
+        try self.bindText(s, 1, tenant);
+        try self.bindText(s, 2, namespace);
+        try self.bindId(s, 3, claim.workflow_id);
+        try self.bindInt(s, 4, event.Kind.cancellation_requested);
+        return try self.step(s);
+    }
+    pub fn claimTimer(self: *Store, allocator: std.mem.Allocator, tenant: []const u8, namespace: []const u8) (Error || std.mem.Allocator.Error)!?TimerClaim {
+        if (!self.onDispatcher()) return self.invoke(Store.claimTimer, .{ allocator, tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        const s = try self.prepare("UPDATE durable_timer SET status_v2='claimed',claimed_epoch=?1 WHERE timer_id=(SELECT timer_id FROM durable_timer WHERE tenant=?2 AND namespace=?3 AND fire_at_utc_ms<=?4 AND (status_v2='ready' OR (status_v2='claimed' AND claimed_epoch<>?1)) ORDER BY fire_at_utc_ms,timer_id LIMIT 1) RETURNING timer_id,workflow_id,payload,schema_id,schema_version;");
+        defer self.finalize(s);
+        try self.bindInt(s, 1, self.runtime_epoch);
+        try self.bindText(s, 2, tenant);
+        try self.bindText(s, 3, namespace);
+        try self.bindInt(s, 4, self.clock.utcNow());
+        if (!try self.step(s)) {
+            try self.commit();
+            return null;
+        }
+        const value = TimerClaim{ .allocator = allocator, .timer_id = self.columnId(s, 0), .workflow_id = self.columnId(s, 1), .runtime_epoch = self.runtime_epoch, .payload = try allocator.dupe(u8, self.columnBlob(s, 2)), .schema = .{ .id = @bitCast(self.columnInt(s, 3)), .version = @intCast(self.columnInt(s, 4)) } };
+        _ = try self.step(s);
+        try self.commit();
+        return value;
+    }
+    pub fn fireTimer(self: *Store, claim: TimerClaim, tenant: []const u8, namespace: []const u8, schema: core.schema.SchemaKey) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.fireTimer, .{ claim, tenant, namespace, schema });
+        defer claim.allocator.free(claim.payload);
+        try self.finishExternal("durable_timer", "timer_id", claim.timer_id, claim.workflow_id, claim.runtime_epoch, tenant, namespace, event.Kind.timer_fired, schema, claim.payload);
+    }
+    pub fn claimOutbox(self: *Store, allocator: std.mem.Allocator, tenant: []const u8, namespace: []const u8) (Error || std.mem.Allocator.Error)!?OutboxClaim {
+        if (!self.onDispatcher()) return self.invoke(Store.claimOutbox, .{ allocator, tenant, namespace });
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        const s = try self.prepare("UPDATE outbox SET status_v2='claimed',claimed_epoch=?1 WHERE message_id=(SELECT message_id FROM outbox WHERE tenant=?2 AND namespace=?3 AND (status_v2='ready' OR (status_v2='claimed' AND claimed_epoch<>?1)) ORDER BY message_id LIMIT 1) RETURNING message_id,workflow_id,payload;");
+        defer self.finalize(s);
+        try self.bindInt(s, 1, self.runtime_epoch);
+        try self.bindText(s, 2, tenant);
+        try self.bindText(s, 3, namespace);
+        if (!try self.step(s)) {
+            try self.commit();
+            return null;
+        }
+        const value = OutboxClaim{ .allocator = allocator, .message_id = self.columnId(s, 0), .workflow_id = self.columnId(s, 1), .runtime_epoch = self.runtime_epoch, .payload = try allocator.dupe(u8, self.columnBlob(s, 2)) };
+        _ = try self.step(s);
+        try self.commit();
+        return value;
+    }
+    pub fn finishOutbox(self: *Store, claim: OutboxClaim) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.finishOutbox, .{claim});
+        defer claim.allocator.free(claim.payload);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (try self.metadataU64("runtime_epoch") != claim.runtime_epoch) return error.StaleRuntimeEpoch;
+        const s = try self.prepare("UPDATE outbox SET status_v2='completed',published_utc_ms=?3 WHERE message_id=?1 AND status_v2='claimed' AND claimed_epoch=?2;");
+        defer self.finalize(s);
+        try self.bindId(s, 1, claim.message_id);
+        try self.bindInt(s, 2, claim.runtime_epoch);
+        try self.bindInt(s, 3, self.clock.utcNow());
+        _ = try self.step(s);
+        if (c.sqlite3_changes(self.db) != 1) return error.StaleRuntimeEpoch;
+    }
+    pub fn abandonOutbox(self: *Store, claim: OutboxClaim) Error!void {
+        if (!self.onDispatcher()) return self.invoke(Store.abandonOutbox, .{claim});
+        defer claim.allocator.free(claim.payload);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const s = try self.prepare("UPDATE outbox SET status_v2='ready',claimed_epoch=NULL WHERE message_id=?1 AND status_v2='claimed' AND claimed_epoch=?2;");
+        defer self.finalize(s);
+        try self.bindId(s, 1, claim.message_id);
+        try self.bindInt(s, 2, claim.runtime_epoch);
+        _ = try self.step(s);
+        if (c.sqlite3_changes(self.db) != 1) return error.StaleRuntimeEpoch;
     }
 
     /// Atomically claims the next ready task or a claim fenced by an older runtime epoch.
@@ -455,7 +607,7 @@ pub const Store = struct {
     fn insertScheduled(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, scheduled: persistence.ScheduledWork) Error!void {
         for (scheduled.activities) |activity| {
             if (activity.payload.len > max_payload_bytes) return error.PayloadTooLarge;
-            const stmt = try self.prepare("INSERT OR IGNORE INTO activity_task(task_id,tenant,namespace,workflow_id,command_sequence,payload) VALUES(?1,?2,?3,?4,?5,?6);");
+            const stmt = try self.prepare("INSERT OR IGNORE INTO activity_task(task_id,tenant,namespace,workflow_id,command_sequence,payload,schema_id,schema_version,available_utc_ms,scheduled_utc_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9);");
             defer self.finalize(stmt);
             try self.bindId(stmt, 1, activity.task_id);
             try self.bindText(stmt, 2, tenant);
@@ -463,11 +615,14 @@ pub const Store = struct {
             try self.bindId(stmt, 4, workflow_id);
             try self.bindInt(stmt, 5, activity.command_sequence);
             try self.bindBlob(stmt, 6, activity.payload);
+            try self.bindInt(stmt, 7, @as(i64, @bitCast(activity.schema.id)));
+            try self.bindInt(stmt, 8, activity.schema.version);
+            try self.bindInt(stmt, 9, self.clock.utcNow());
             _ = try self.step(stmt);
         }
         for (scheduled.timers) |timer| {
             if (timer.payload.len > max_payload_bytes) return error.PayloadTooLarge;
-            const stmt = try self.prepare("INSERT OR IGNORE INTO durable_timer(timer_id,tenant,namespace,workflow_id,fire_at_utc_ms,payload) VALUES(?1,?2,?3,?4,?5,?6);");
+            const stmt = try self.prepare("INSERT OR IGNORE INTO durable_timer(timer_id,tenant,namespace,workflow_id,fire_at_utc_ms,payload,schema_id,schema_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
             defer self.finalize(stmt);
             try self.bindId(stmt, 1, timer.timer_id);
             try self.bindText(stmt, 2, tenant);
@@ -475,6 +630,8 @@ pub const Store = struct {
             try self.bindId(stmt, 4, workflow_id);
             try self.bindInt(stmt, 5, timer.fire_at_utc_ms);
             try self.bindBlob(stmt, 6, timer.payload);
+            try self.bindInt(stmt, 7, @as(i64, @bitCast(timer.schema.id)));
+            try self.bindInt(stmt, 8, timer.schema.version);
             _ = try self.step(stmt);
         }
         for (scheduled.outbox) |message| {
@@ -489,18 +646,103 @@ pub const Store = struct {
             _ = try self.step(stmt);
         }
     }
+    fn finishExternal(self: *Store, comptime table: []const u8, comptime id_column: []const u8, id: core.StableId, workflow_id: core.StableId, epoch: u64, tenant: []const u8, namespace: []const u8, kind: u32, schema: core.schema.SchemaKey, payload: []const u8) Error!void {
+        if (payload.len > max_payload_bytes) return error.PayloadTooLarge;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.metadataU64("runtime_epoch") != epoch) return error.StaleRuntimeEpoch;
+        const done = try self.prepare("UPDATE " ++ table ++ " SET status_v2='completed' WHERE " ++ id_column ++ "=?1 AND status_v2='claimed' AND claimed_epoch=?2;");
+        defer self.finalize(done);
+        try self.bindId(done, 1, id);
+        try self.bindInt(done, 2, epoch);
+        _ = try self.step(done);
+        if (c.sqlite3_changes(self.db) != 1) return error.StaleRuntimeEpoch;
+        const seq = try self.prepare("SELECT next_sequence FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running';");
+        defer self.finalize(seq);
+        try self.bindText(seq, 1, tenant);
+        try self.bindText(seq, 2, namespace);
+        try self.bindId(seq, 3, workflow_id);
+        if (!try self.step(seq)) return error.NotFound;
+        const sequence = self.columnInt(seq, 0);
+        const history = try self.prepare("INSERT INTO workflow_history(tenant,namespace,workflow_id,sequence,event_id,kind,event_utc_ms,schema_id,schema_version,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+        defer self.finalize(history);
+        try self.bindText(history, 1, tenant);
+        try self.bindText(history, 2, namespace);
+        try self.bindId(history, 3, workflow_id);
+        try self.bindInt(history, 4, sequence);
+        try self.bindId(history, 5, derivedEventId(id, sequence));
+        try self.bindInt(history, 6, kind);
+        try self.bindInt(history, 7, self.clock.utcNow());
+        try self.bindInt(history, 8, @as(i64, @bitCast(schema.id)));
+        try self.bindInt(history, 9, schema.version);
+        try self.bindBlob(history, 10, payload);
+        _ = try self.step(history);
+        const instance_update = try self.prepare("UPDATE workflow_instance SET next_sequence=next_sequence+1,updated_utc_ms=?4 WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3;");
+        defer self.finalize(instance_update);
+        try self.bindText(instance_update, 1, tenant);
+        try self.bindText(instance_update, 2, namespace);
+        try self.bindId(instance_update, 3, workflow_id);
+        try self.bindInt(instance_update, 4, self.clock.utcNow());
+        _ = try self.step(instance_update);
+        const wake = try self.prepare("INSERT INTO workflow_task(task_id,tenant,namespace,workflow_id,status,available_utc_ms) SELECT ?1,?2,?3,?4,'ready',?5 WHERE NOT EXISTS(SELECT 1 FROM workflow_task WHERE tenant=?2 AND namespace=?3 AND workflow_id=?4 AND status IN ('ready','claimed'));");
+        defer self.finalize(wake);
+        try self.bindId(wake, 1, derivedEventId(id, sequence + 1));
+        try self.bindText(wake, 2, tenant);
+        try self.bindText(wake, 3, namespace);
+        try self.bindId(wake, 4, workflow_id);
+        try self.bindInt(wake, 5, self.clock.utcNow());
+        _ = try self.step(wake);
+        try self.commit();
+    }
+    fn appendHistoryFact(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, event_id: core.StableId, kind: u32, schema: core.schema.SchemaKey, payload: []const u8, utc_ms: i64) Error!void {
+        const seq = try self.prepare("SELECT next_sequence FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running';");
+        defer self.finalize(seq);
+        try self.bindText(seq, 1, tenant);
+        try self.bindText(seq, 2, namespace);
+        try self.bindId(seq, 3, workflow_id);
+        if (!try self.step(seq)) return error.NotFound;
+        const sequence = self.columnInt(seq, 0);
+        const history = try self.prepare("INSERT INTO workflow_history(tenant,namespace,workflow_id,sequence,event_id,kind,event_utc_ms,schema_id,schema_version,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
+        defer self.finalize(history);
+        try self.bindText(history, 1, tenant);
+        try self.bindText(history, 2, namespace);
+        try self.bindId(history, 3, workflow_id);
+        try self.bindInt(history, 4, sequence);
+        try self.bindId(history, 5, event_id);
+        try self.bindInt(history, 6, kind);
+        try self.bindInt(history, 7, utc_ms);
+        try self.bindInt(history, 8, @as(i64, @bitCast(schema.id)));
+        try self.bindInt(history, 9, schema.version);
+        try self.bindBlob(history, 10, payload);
+        _ = try self.step(history);
+        const update = try self.prepare("UPDATE workflow_instance SET next_sequence=next_sequence+1,updated_utc_ms=?4 WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3;");
+        defer self.finalize(update);
+        try self.bindText(update, 1, tenant);
+        try self.bindText(update, 2, namespace);
+        try self.bindId(update, 3, workflow_id);
+        try self.bindInt(update, 4, utc_ms);
+        _ = try self.step(update);
+    }
     fn applyMigration(self: *Store) Error!void {
         try self.exec("CREATE TABLE IF NOT EXISTS spindle_schema_migration(version INTEGER PRIMARY KEY,checksum INTEGER NOT NULL) STRICT;");
-        const stmt = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=1;");
+        try self.applyOneMigration(1, migration_sql);
+        try self.applyOneMigration(2, migration_v2_sql);
+    }
+    fn applyOneMigration(self: *Store, version: i64, sql: []const u8) Error!void {
+        const stmt = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=?1;");
         defer self.finalize(stmt);
+        try self.bindInt(stmt, 1, version);
         if (try self.step(stmt)) {
-            if (@as(u64, @bitCast(self.columnInt(stmt, 0))) != core.hash.content(migration_sql)) return error.MigrationMismatch;
+            if (@as(u64, @bitCast(self.columnInt(stmt, 0))) != core.hash.content(sql)) return error.MigrationMismatch;
             return;
         }
-        try self.exec(migration_sql);
-        const record = try self.prepare("INSERT INTO spindle_schema_migration(version,checksum) VALUES(1,?1);");
+        try self.exec(@ptrCast(sql.ptr));
+        const record = try self.prepare("INSERT INTO spindle_schema_migration(version,checksum) VALUES(?1,?2);");
         defer self.finalize(record);
-        try self.bindInt(record, 1, @as(i64, @bitCast(core.hash.content(migration_sql))));
+        try self.bindInt(record, 1, version);
+        try self.bindInt(record, 2, @as(i64, @bitCast(core.hash.content(sql))));
         _ = try self.step(record);
     }
     fn metadataU64(self: *Store, key: []const u8) Error!u64 {
@@ -592,6 +834,14 @@ fn statusText(value: instance.Status) []const u8 {
         .failed => "failed",
         .cancelled => "cancelled",
     };
+}
+fn derivedEventId(base: core.StableId, sequence: i64) core.StableId {
+    var bytes = base.toBytes();
+    const high = std.mem.readInt(u64, bytes[0..8], .big) ^ 0x6576_656e_742e_7766;
+    const low = std.mem.readInt(u64, bytes[8..16], .big) ^ @as(u64, @bitCast(sequence));
+    std.mem.writeInt(u64, bytes[0..8], high, .big);
+    std.mem.writeInt(u64, bytes[8..16], low, .big);
+    return .fromBytes(bytes);
 }
 fn map(code: c_int) Error {
     return switch (code & 0xff) {

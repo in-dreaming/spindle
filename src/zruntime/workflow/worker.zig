@@ -7,7 +7,7 @@ const persistence = @import("persistence.zig");
 const snapshot = @import("snapshot.zig");
 
 pub const checkpoint_interval: u64 = 64;
-pub const Error = error{ UnsupportedCommand, CommandCapacityExceeded, NonDecisionEvent, DefinitionUnavailable };
+pub const Error = error{ UnsupportedCommand, CommandCapacityExceeded, CommandSequenceOverflow, NonDecisionEvent, DefinitionUnavailable };
 pub const TransitionResult = struct {
     state: []const u8,
     status: instance.Status,
@@ -25,9 +25,10 @@ pub fn processDecisions(def: definition.Definition, workflow_id: @import("../cor
     var expected = last_processed_sequence + 1;
     var output = command.Buffer.init(command_storage);
     for (decisions) |decision| {
-        if (!isDecisionEvent(decision.kind)) return error.NonDecisionEvent;
         if (decision.sequence != expected) return error.InvalidSequence;
         expected += 1;
+        if (decision.kind == event.Kind.activity_retry_scheduled) continue;
+        if (!isDecisionEvent(decision.kind)) return error.NonDecisionEvent;
         var context = definition.WorkflowContext{ .logical_utc_ms = decision.utc_ms, .random_values = &.{}, .commands = &output };
         const result = try def.transition(&context, state, decision);
         state = result.new_state;
@@ -65,7 +66,7 @@ pub fn processRegisteredDecisions(registry: *const definition.Registry, definiti
 
 /// Converts deterministic commands into Task 17 persistence work. Activities, timers, and outbox records
 /// are persisted only; this worker never executes or publishes them.
-pub fn normalizeCommands(allocator: std.mem.Allocator, workflow_id: @import("../core/stable_id.zig").StableId, commands: []const command.Command) (Error || std.mem.Allocator.Error)!persistence.ScheduledWork {
+pub fn normalizeCommands(allocator: std.mem.Allocator, workflow_id: @import("../core/stable_id.zig").StableId, decision_sequence: u64, scheduled_utc_ms: i64, commands: []const command.Command) (Error || std.mem.Allocator.Error || error{InvalidTimerCommand})!persistence.ScheduledWork {
     var activities: std.ArrayListUnmanaged(persistence.ActivityTask) = .empty;
     errdefer activities.deinit(allocator);
     var timers: std.ArrayListUnmanaged(persistence.Timer) = .empty;
@@ -73,10 +74,16 @@ pub fn normalizeCommands(allocator: std.mem.Allocator, workflow_id: @import("../
     var outbox: std.ArrayListUnmanaged(persistence.OutboxMessage) = .empty;
     errdefer outbox.deinit(allocator);
     for (commands) |value| {
-        const id = derivedId(workflow_id, value.sequence, value.kind);
+        if (decision_sequence > std.math.maxInt(u32) or value.sequence > std.math.maxInt(u32)) return error.CommandSequenceOverflow;
+        const global_sequence = (decision_sequence << 32) | value.sequence;
+        const id = derivedId(workflow_id, global_sequence, value.kind);
         switch (value.kind) {
-            command.Kind.schedule_activity => try activities.append(allocator, .{ .task_id = id, .command_sequence = value.sequence, .payload = value.payload.bytes }),
-            command.Kind.schedule_timer => try timers.append(allocator, .{ .timer_id = id, .fire_at_utc_ms = 0, .payload = value.payload.bytes }),
+            command.Kind.schedule_activity => try activities.append(allocator, .{ .task_id = id, .command_sequence = global_sequence, .schema = value.payload.schema, .payload = value.payload.bytes }),
+            command.Kind.schedule_timer => {
+                const timer = try command.decodeTimer(value.payload.bytes);
+                const delay: i64 = @intCast(@min(timer.delay_ms, @as(u64, std.math.maxInt(i64))));
+                try timers.append(allocator, .{ .timer_id = id, .fire_at_utc_ms = std.math.add(i64, scheduled_utc_ms, delay) catch std.math.maxInt(i64), .schema = value.payload.schema, .payload = timer.payload });
+            },
             command.Kind.send_signal => try outbox.append(allocator, .{ .message_id = id, .payload = value.payload.bytes }),
             command.Kind.start_child => return error.UnsupportedCommand,
             else => {},
