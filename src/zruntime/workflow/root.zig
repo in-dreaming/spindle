@@ -8,6 +8,8 @@ pub const retry = @import("retry.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const migration = @import("migration.zig");
 pub const replay = @import("replay.zig");
+/// PostgreSQL-neutral transactional persistence contract.
+pub const persistence = @import("persistence.zig");
 pub const WorkflowId = instance.WorkflowId;
 pub const Definition = definition.Definition;
 pub const Registry = definition.Registry;

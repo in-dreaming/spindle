@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const stress_iterations = b.option(u32, "stress-iterations", "Iterations used by bounded stress tests") orelse 128;
     const postgres_url = b.option([]const u8, "postgres-url", "PostgreSQL connection URL for integration tests");
+    const postgres_enabled = b.option(bool, "postgres", "Build PostgreSQL/libpq backend") orelse false;
+    const postgres_dsn = postgres_url;
 
     const spindle = b.addModule("spindle", .{
         .root_source_file = b.path("src/root.zig"),
@@ -80,13 +82,21 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmark smoke workload");
     bench_step.dependOn(&run_bench.step);
 
-    const postgres_step = b.step("test-postgres", "Run PostgreSQL integration tests when configured");
-    postgres_step.dependOn(postgresNoticeStep(b, postgres_url));
+    const postgres_step = b.step("test-postgres", "Run real PostgreSQL integration tests");
+    // This target deliberately always links libpq: it never falls back to an in-memory or SQLite substitute.
+    const postgres_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tests/integration/workflow_postgres.zig"), .target = target, .optimize = optimize }) });
+    postgres_tests.root_module.addImport("spindle", spindle);
+    postgres_tests.root_module.addImport("workflow_postgres", b.createModule(.{ .root_source_file = b.path("src/zruntime/workflow/postgres.zig"), .target = target, .optimize = optimize }));
+    postgres_tests.root_module.linkSystemLibrary("pq", .{});
+    const run_postgres_tests = b.addRunArtifact(postgres_tests);
+    if (postgres_dsn) |url| run_postgres_tests.setEnvironmentVariable("SPINDLE_TEST_PG_DSN", url);
+    postgres_step.dependOn(&run_postgres_tests.step);
 
     const test_all = b.step("test-all", "Run all non-PostgreSQL validation suites");
     test_all.dependOn(check);
     test_all.dependOn(test_step);
     test_all.dependOn(stress_step);
+    if (postgres_enabled or postgres_dsn != null) test_all.dependOn(postgres_step);
 }
 
 fn addTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, spindle: *std.Build.Module) *std.Build.Step.Compile {
@@ -99,23 +109,4 @@ fn addTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, op
     });
     tests.root_module.addImport("spindle", spindle);
     return tests;
-}
-
-fn postgresNoticeStep(b: *std.Build, postgres_url: ?[]const u8) *std.Build.Step {
-    const step = b.allocator.create(std.Build.Step) catch @panic("out of memory");
-    step.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = "postgres test availability",
-        .owner = b,
-        .makeFn = if (postgres_url == null) postgresTestsSkipped else postgresTestsDeferred,
-    });
-    return step;
-}
-
-fn postgresTestsSkipped(_: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-    std.debug.print("PostgreSQL tests skipped: pass -Dpostgres-url=<connection-url> after task 16 registers them.\n", .{});
-}
-
-fn postgresTestsDeferred(_: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-    std.debug.print("PostgreSQL tests are not registered until task 16.\n", .{});
 }
