@@ -8,7 +8,19 @@ pub const ComponentOps = struct {
     clone: *const fn (destination: *anyopaque, source: *const anyopaque) anyerror!void,
     deinit: *const fn (value: *anyopaque) void,
 };
-pub const ComponentMeta = struct { id: ComponentTypeId, name: []const u8, size: usize, alignment: usize, schema_version: u32, flags: ComponentFlags, ops: ComponentOps };
+/// Fixed-width snapshot conversion for components that contain external handles. The encoder must write only stable data.
+pub const SnapshotCodec = struct {
+    context: ?*anyopaque = null,
+    encode: *const fn (?*anyopaque, *const anyopaque, []u8) anyerror!void,
+    decode: *const fn (?*anyopaque, *anyopaque, []const u8) anyerror!void,
+};
+/// One explicitly registered schema step. Multi-version upgrades are applied one version at a time.
+pub const SnapshotMigration = struct {
+    from_version: u32,
+    apply: *const fn (*anyopaque, []const u8) anyerror!void,
+};
+pub const SnapshotHooks = struct { codec: ?SnapshotCodec = null, migration: ?SnapshotMigration = null };
+pub const ComponentMeta = struct { id: ComponentTypeId, name: []const u8, size: usize, alignment: usize, schema_version: u32, flags: ComponentFlags, ops: ComponentOps, snapshot: SnapshotHooks = .{} };
 pub const Error = error{ Frozen, DuplicateId, DuplicateName, UnknownComponent, InvalidName };
 
 fn noopDeinit(_: *anyopaque) void {}

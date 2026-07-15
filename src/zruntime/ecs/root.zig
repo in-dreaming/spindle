@@ -20,6 +20,10 @@ pub const event = @import("event.zig");
 pub const system = @import("system.zig");
 /// ECS access-hazard schedule compiler.
 pub const schedule = @import("schedule.zig");
+/// Stable ECS state snapshots and base-bound incremental restoration.
+pub const snapshot = @import("snapshot.zig");
+/// Explicit deterministic input records and bounded rollback storage.
+pub const frame_journal = @import("frame_journal.zig");
 pub const Entity = entity.Entity;
 pub const ComponentTypeId = component_registry.ComponentTypeId;
 pub const World = world.World;
@@ -31,3 +35,6 @@ pub const SystemDesc = system.SystemDesc;
 pub const SystemContext = system.SystemContext;
 pub const Phase = system.Phase;
 pub const Target = system.Target;
+pub const Snapshot = snapshot.Snapshot;
+pub const FrameJournal = frame_journal.Journal;
+pub const RollbackRing = frame_journal.RollbackRing;
