@@ -428,3 +428,164 @@ test "work-stealing priority aging bounds background starvation" {
     try background.wait();
     try std.testing.expect(background_observed.load(.acquire) <= 5);
 }
+
+const ParallelProbe = struct {
+    total: *std.atomic.Value(usize),
+    fn run(self: *@This(), begin: usize, end: usize, _: spindle.executor.CancellationToken) !void {
+        _ = self.total.fetchAdd(end - begin, .acq_rel);
+    }
+};
+
+test "parallel algorithms use bounded chunks and match serial references" {
+    var pool = try spindle.executor.FixedPool.init(std.testing.allocator, 2, 32);
+    defer pool.deinit();
+    var total: std.atomic.Value(usize) = .init(0);
+    var probe = ParallelProbe{ .total = &total };
+    try spindle.parallel.forRange(std.testing.allocator, pool.executor(), .{ .end = 137 }, .{ .grain = 11 }, &probe, ParallelProbe.run);
+    try std.testing.expectEqual(@as(usize, 137), total.load(.acquire));
+    const add = struct {
+        fn run(a: u32, b: u32) u32 {
+            return a + b;
+        }
+    }.run;
+    const input = [_]u32{ 1, 2, 3, 4 };
+    try std.testing.expectEqual(@as(u32, 10), spindle.parallel.reduce.reduce(std.testing.allocator, pool.executor(), u32, &input, 0, .{ .deterministic = true }, add));
+    var scanned: [4]u32 = undefined;
+    try spindle.parallel.scan.exclusive(std.testing.allocator, pool.executor(), u32, &input, &scanned, 0, add);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 3, 6 }, &scanned);
+}
+
+test "completion schedules its continuation on the selected executor" {
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 2);
+    defer pump.deinit();
+    var observed: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &observed };
+    var continuation = spindle.executor.Task.init(TaskProbe.run, &probe);
+    var completion = spindle.io_adapter.Completion(u32).init(99);
+    try completion.then(pump.executor(), &continuation);
+    try completion.finish(7);
+    _ = pump.drain(1);
+    try std.testing.expectEqual(@as(u32, 7), try completion.wait());
+    try std.testing.expectEqual(@as(u32, 1), observed.load(.acquire));
+}
+
+test "bounded pipeline reports backpressure and drains values" {
+    var storage: [1]u32 = undefined;
+    var pipe = spindle.parallel.pipeline.Bounded(u32).init(&storage);
+    try pipe.push(4);
+    try std.testing.expectError(error.Backpressure, pipe.push(5));
+    try std.testing.expectEqual(@as(u32, 4), try pipe.pop());
+    pipe.close();
+    try std.testing.expectError(error.Closed, pipe.pop());
+}
+
+test "parallel scan and stable sort match serial golden results" {
+    var pool = try spindle.executor.FixedPool.init(std.testing.allocator, 2, 32);
+    defer pool.deinit();
+    const add = struct {
+        fn run(a: u32, b: u32) u32 {
+            return a + b;
+        }
+    }.run;
+    const input = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var exclusive: [input.len]u32 = undefined;
+    var inclusive: [input.len]u32 = undefined;
+    try spindle.parallel.scan.exclusive(std.testing.allocator, pool.executor(), u32, &input, &exclusive, 0, add);
+    try spindle.parallel.scan.inclusive(std.testing.allocator, pool.executor(), u32, &input, &inclusive, add);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 3, 6, 10, 15, 21, 28, 36 }, &exclusive);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 1, 3, 6, 10, 15, 21, 28, 36, 45 }, &inclusive);
+    var values = [_]u32{ 4, 1, 3, 3, 2, 5, 0 };
+    try spindle.parallel.sort.stable(std.testing.allocator, pool.executor(), u32, &values, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 2, 3, 3, 4, 5 }, &values);
+}
+
+const FileIoProbe = struct {
+    fn write(runtime: spindle.io_adapter.IoRuntime, path: []const u8) !void {
+        try runtime.writeFile(path, "real-file-data");
+    }
+};
+
+test "io runtime asynchronously writes and reads a real temporary file" {
+    const name = "spindle-task06-io-runtime.tmp";
+    const runtime = spindle.io_adapter.IoRuntime.init(std.Options.debug_io);
+    runtime.deleteFile(name) catch {};
+    defer runtime.deleteFile(name) catch {};
+    var future = runtime.async(FileIoProbe.write, .{ runtime, name });
+    try future.await(runtime.io);
+    var buffer: [32]u8 = undefined;
+    const read = try runtime.readFile(name, &buffer);
+    try std.testing.expectEqualStrings("real-file-data", read);
+}
+
+const PipelineProbe = struct {
+    count: *std.atomic.Value(u32),
+    sum: *std.atomic.Value(u32),
+    fail_at: ?u32 = null,
+    fn consume(self: *@This(), item: u32, _: spindle.executor.CancellationToken) !void {
+        // Deliberately compute-bound: the bounded queue must absorb this slower stage.
+        for (0..256) |_| std.atomic.spinLoopHint();
+        _ = self.count.fetchAdd(1, .acq_rel);
+        _ = self.sum.fetchAdd(item, .acq_rel);
+        if (self.fail_at) |value| if (item == value) return error.ConsumerFailed;
+    }
+    fn dispose(_: u32) void {}
+};
+
+test "executor pipeline preserves items with a slow consumer and joins failure" {
+    var pool = try spindle.executor.FixedPool.init(std.testing.allocator, 2, 32);
+    defer pool.deinit();
+    const input = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var count: std.atomic.Value(u32) = .init(0);
+    var sum: std.atomic.Value(u32) = .init(0);
+    var probe = PipelineProbe{ .count = &count, .sum = &sum };
+    try spindle.parallel.pipeline.run(std.testing.allocator, pool.executor(), u32, &input, 2, &probe, PipelineProbe.consume, PipelineProbe.dispose);
+    try std.testing.expectEqual(@as(u32, input.len), count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 36), sum.load(.acquire));
+    count.store(0, .release);
+    sum.store(0, .release);
+    probe.fail_at = 4;
+    try std.testing.expectError(error.TaskFailed, spindle.parallel.pipeline.run(std.testing.allocator, pool.executor(), u32, &input, 2, &probe, PipelineProbe.consume, PipelineProbe.dispose));
+    try std.testing.expect(count.load(.acquire) >= 1);
+}
+
+const BlockingBridgeProbe = struct {
+    started: *spindle.sync.Semaphore,
+    release: *spindle.sync.Event,
+    completed: *std.atomic.Value(u32),
+    fn run(task: *spindle.executor.Task) void {
+        const self: *BlockingBridgeProbe = @ptrCast(@alignCast(task.context.?));
+        self.started.release(1) catch return;
+        self.release.wait(null, .{}) catch return;
+        _ = self.completed.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "blocking bridge is bounded and does not consume compute workers" {
+    var blocking = try spindle.executor.BlockingExecutor.init(std.testing.allocator, 1, 2);
+    defer blocking.deinit();
+    var compute = try spindle.executor.FixedPool.init(std.testing.allocator, 1, 2);
+    defer compute.deinit();
+    var bridge = spindle.io_adapter.BlockingBridge.init(&blocking);
+    var started = try spindle.sync.Semaphore.init(0, 1);
+    var release = spindle.sync.Event.init(.manual, false);
+    var finished: std.atomic.Value(u32) = .init(0);
+    var probe = BlockingBridgeProbe{ .started = &started, .release = &release, .completed = &finished };
+    var first = spindle.executor.Task.init(BlockingBridgeProbe.run, &probe);
+    var queued = spindle.executor.Task.init(BlockingBridgeProbe.run, &probe);
+    var queued_second = spindle.executor.Task.init(BlockingBridgeProbe.run, &probe);
+    var rejected = spindle.executor.Task.init(BlockingBridgeProbe.run, &probe);
+    try bridge.submit(&first, null, null);
+    try started.acquire(spindle.platform.park.deadlineAfter(std.time.ns_per_s), .{});
+    try bridge.submit(&queued, null, null);
+    try bridge.submit(&queued_second, null, null);
+    try std.testing.expectError(error.Backpressure, bridge.submit(&rejected, null, null));
+    var compute_probe = TaskProbe{ .value = &finished };
+    var compute_task = spindle.executor.Task.init(TaskProbe.run, &compute_probe);
+    try compute.submit(&compute_task, .{});
+    try compute_task.wait();
+    release.set();
+    try first.wait();
+    try queued.wait();
+    try queued_second.wait();
+    try std.testing.expect(finished.load(.acquire) >= 3);
+}

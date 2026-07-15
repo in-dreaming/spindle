@@ -28,6 +28,25 @@ pub fn main() void {
     const allocator = std.heap.page_allocator;
     const work_ns = [_]u64{ 0, 1_000, 10_000, 100_000, 1_000_000 };
     for (work_ns) |duration| runWorkload(allocator, duration);
+    runParallelFor(allocator);
+}
+
+const ParallelBench = struct {
+    total: *std.atomic.Value(usize),
+    fn run(self: *@This(), begin: usize, end: usize, _: spindle.executor.CancellationToken) !void {
+        _ = self.total.fetchAdd(end - begin, .acq_rel);
+    }
+};
+
+fn runParallelFor(allocator: std.mem.Allocator) void {
+    var pool = spindle.executor.FixedPool.init(allocator, 2, 64) catch return;
+    defer pool.deinit();
+    var total: std.atomic.Value(usize) = .init(0);
+    var probe = ParallelBench{ .total = &total };
+    const started = std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake);
+    spindle.parallel.forRange(allocator, pool.executor(), .{ .end = 65_536 }, .{ .grain = 1024 }, &probe, ParallelBench.run) catch return;
+    const elapsed: u64 = @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds - started.raw.nanoseconds);
+    std.debug.print("{{\"benchmark\":\"parallel_for\",\"grain\":1024,\"items\":{d},\"elapsed_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ total.load(.acquire), elapsed, @tagName(builtin.os.tag) });
 }
 
 fn runWorkload(allocator: std.mem.Allocator, work_ns: u64) void {
