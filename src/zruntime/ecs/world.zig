@@ -5,6 +5,13 @@ const registry = @import("component_registry.zig");
 const signature = @import("signature.zig");
 const archetype = @import("archetype.zig");
 const chunk_mod = @import("chunk.zig");
+const system = @import("system.zig");
+const schedule = @import("schedule.zig");
+const query = @import("query.zig");
+const command = @import("command_buffer.zig");
+const executor = @import("../executor/root.zig");
+const AdaptiveMutex = @import("../sync/adaptive_mutex.zig").AdaptiveMutex;
+const metrics = @import("../observability/metrics.zig");
 
 /// Single-threaded archetype ECS storage. Returned component borrows are invalidated by any structural change.
 pub const World = struct {
@@ -15,16 +22,23 @@ pub const World = struct {
     chunk_bytes: usize,
     archetype_version: u64 = 0,
     change_tick: u32 = 1,
-    active_chunk_borrows: usize = 0,
+    active_chunk_borrows: std.atomic.Value(usize) = .init(0),
+    systems: system.Registry,
+    resources: system.ResourceRegistry,
+    compiled_schedule: ?system.CompiledSchedule = null,
+    schedule_dirty: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: struct { chunk_bytes: usize = 2048 }) !World {
-        var result: World = .{ .allocator = allocator, .registry = registry.ComponentRegistry.init(allocator), .entities = entity.EntityStore.init(allocator), .chunk_bytes = @max(options.chunk_bytes, 2048) };
+        var result: World = .{ .allocator = allocator, .registry = registry.ComponentRegistry.init(allocator), .entities = entity.EntityStore.init(allocator), .chunk_bytes = @max(options.chunk_bytes, 2048), .systems = system.Registry.init(allocator), .resources = system.ResourceRegistry.init(allocator) };
         errdefer result.deinit();
         const empty = signature.Signature.init(allocator);
         try result.archetypes.append(allocator, archetype.Archetype.init(allocator, empty));
         return result;
     }
     pub fn deinit(self: *World) void {
+        if (self.compiled_schedule) |*value| value.deinit();
+        self.resources.deinit();
+        self.systems.deinit();
         for (self.archetypes.items) |*item| item.deinit();
         self.archetypes.deinit(self.allocator);
         self.entities.deinit();
@@ -40,6 +54,144 @@ pub const World = struct {
     }
     pub fn componentId(_: *const World, name: []const u8) registry.ComponentTypeId {
         return registry.ComponentRegistry.idFor(name);
+    }
+    /// Registers an ECS singleton. The caller owns the pointed-to value for the world's lifetime.
+    pub fn registerResource(self: *World, id: system.ResourceId, value: *anyopaque) !void {
+        try self.resources.register(id, value);
+        self.invalidateSchedule();
+    }
+    /// Adds a static system declaration. It invalidates the reusable compiled schedule.
+    pub fn registerSystem(self: *World, desc: system.SystemDesc) !void {
+        try self.systems.register(desc);
+        self.invalidateSchedule();
+    }
+    /// Marks the immutable schedule stale after system configuration changes.
+    pub fn invalidateSchedule(self: *World) void {
+        self.schedule_dirty = true;
+    }
+    /// Compiles access hazards and explicit dependencies. New archetypes do not invalidate this result.
+    pub fn compileSchedule(self: *World) !void {
+        if (!self.schedule_dirty and self.compiled_schedule != null) return;
+        const fresh = try schedule.compile(self.allocator, &self.systems);
+        if (self.compiled_schedule) |*old| old.deinit();
+        self.compiled_schedule = fresh;
+        self.schedule_dirty = false;
+    }
+    /// Executor routing used by ECS updates. Main and render targets must use PumpExecutor views supplied by the caller.
+    /// Counters updated by the real scheduler execution path. Callers own the value and may snapshot it concurrently.
+    pub const SchedulerMetrics = struct {
+        batches: metrics.Counter = .{},
+        system_jobs: metrics.Counter = .{},
+        chunk_jobs: metrics.Counter = .{},
+        command_merges: metrics.Counter = .{},
+        failures: metrics.Counter = .{},
+    };
+    pub const SchedulerRuntime = struct { compute: executor.Executor, main: ?executor.Executor = null, render: ?executor.Executor = null, events: ?@import("../observability/event.zig").EventSink = null, metrics: ?*SchedulerMetrics = null };
+    /// Runs compiled phases and commits each batch's structural commands at its barrier.
+    pub fn update(self: *World, runtime: SchedulerRuntime, dt: f32) !void {
+        try self.compileSchedule();
+        const compiled = &self.compiled_schedule.?;
+        for (compiled.phases) |phase| for (phase.batches) |batch| try self.runBatch(runtime, dt, batch);
+        _ = self.advanceChangeTick();
+    }
+    fn runBatch(self: *World, runtime: SchedulerRuntime, dt: f32, batch: system.Batch) !void {
+        if (runtime.events) |sink| sink.emit(.{ .monotonic_ns = nowNs(), .kind = "SystemStart", .value = @intCast(batch.systems.len) });
+        if (runtime.metrics) |value| value.batches.add(1);
+        var queue = command.CommandQueue.init(self.allocator);
+        var buffers: std.ArrayListUnmanaged(command.CommandBuffer) = .empty;
+        defer {
+            for (buffers.items) |*buffer| buffer.deinit();
+            buffers.deinit(self.allocator);
+        }
+        var jobs: std.ArrayListUnmanaged(ScheduledJob) = .empty;
+        defer jobs.deinit(self.allocator);
+        for (batch.systems) |id| {
+            const registered = self.systems.find(id) orelse return error.UnknownSystem;
+            var plan = try query.QueryPlan.init(self.allocator, self, registered.desc.query);
+            defer plan.deinit();
+            var it = try plan.iterator(self);
+            var found = false;
+            while (it.next()) |view| {
+                found = true;
+                var start: usize = 0;
+                while (start < view.chunk.count) : (start += registered.desc.grain) try jobs.append(self.allocator, .{ .registered = registered, .chunk = view.chunk, .start = start, .end = @min(view.chunk.count, start + registered.desc.grain), .query = registered.desc.query });
+                var released = view;
+                released.deinit();
+            }
+            if (!found) try jobs.append(self.allocator, .{ .registered = registered, .chunk = null, .start = 0, .end = 0, .query = registered.desc.query });
+        }
+        const task_values = try self.allocator.alloc(executor.Task, jobs.items.len);
+        defer self.allocator.free(task_values);
+        const contexts = try self.allocator.alloc(JobContext, jobs.items.len);
+        defer self.allocator.free(contexts);
+        var failure = BatchFailure{};
+        for (jobs.items, 0..) |job, i| {
+            if (job.chunk != null) if (runtime.events) |sink| sink.emit(.{ .monotonic_ns = nowNs(), .kind = "ChunkJob", .value = @intCast(job.end - job.start) });
+            if (runtime.metrics) |value| {
+                value.system_jobs.add(1);
+                if (job.chunk != null) value.chunk_jobs.add(1);
+            }
+            try buffers.append(self.allocator, queue.buffer());
+            contexts[i] = .{ .world = self, .job = job, .buffer = &buffers.items[i], .dt = dt, .failure = &failure };
+            task_values[i] = executor.Task.init(runJob, &contexts[i]);
+            const target = switch (job.registered.desc.target) {
+                .compute => runtime.compute,
+                .main => runtime.main orelse return error.MissingMainExecutor,
+                .render => runtime.render orelse return error.MissingRenderExecutor,
+            };
+            try target.submit(&task_values[i], .{});
+        }
+        for (task_values, jobs.items) |*task, job| {
+            const target = switch (job.registered.desc.target) {
+                .compute => runtime.compute,
+                .main => runtime.main orelse return error.MissingMainExecutor,
+                .render => runtime.render orelse return error.MissingRenderExecutor,
+            };
+            target.helpUntil(task, taskDone);
+            task.wait() catch return error.TaskWaitFailed;
+        }
+        if (failure.value) |err| {
+            if (runtime.metrics) |value| value.failures.add(1);
+            return err;
+        }
+        try queue.apply(self, buffers.items);
+        if (runtime.metrics) |value| value.command_merges.add(1);
+        if (runtime.events) |sink| sink.emit(.{ .monotonic_ns = nowNs(), .kind = "CommandMerge", .value = @intCast(buffers.items.len) });
+        for (batch.systems) |id| self.systems.find(id).?.last_run_tick = self.change_tick;
+        if (runtime.events) |sink| sink.emit(.{ .monotonic_ns = nowNs(), .kind = "SystemEnd", .value = @intCast(batch.systems.len) });
+    }
+    const ScheduledJob = struct { registered: *system.Registered, chunk: ?*chunk_mod.Chunk, start: usize, end: usize, query: query.Query };
+    const BatchFailure = struct { mutex: AdaptiveMutex = .{}, value: ?anyerror = null };
+    const JobContext = struct { world: *World, job: ScheduledJob, buffer: *command.CommandBuffer, dt: f32, failure: *BatchFailure };
+    fn runJob(task: *executor.Task) void {
+        const ctx: *JobContext = @ptrCast(@alignCast(task.context.?));
+        var system_ctx = system.SystemContext{ .dt = ctx.dt, .commands = ctx.buffer, .last_run_tick = ctx.job.registered.last_run_tick, .resources = &ctx.world.resources, .desc = &ctx.job.registered.desc };
+        if (ctx.job.chunk) |chunk| {
+            ctx.world.beginChunkBorrow();
+            defer ctx.world.endChunkBorrow();
+            var view = query.ChunkView{ .world = ctx.world, .chunk = chunk, .query = ctx.job.query, .start = ctx.job.start, .end = ctx.job.end };
+            ctx.job.registered.desc.run_fn(&system_ctx, &view) catch |err| {
+                ctx.failure.mutex.lock();
+                ctx.failure.value = ctx.failure.value orelse err;
+                ctx.failure.mutex.unlock();
+                task.fail();
+            };
+        } else ctx.job.registered.desc.run_fn(&system_ctx, null) catch |err| {
+            ctx.failure.mutex.lock();
+            ctx.failure.value = ctx.failure.value orelse err;
+            ctx.failure.mutex.unlock();
+            task.fail();
+        };
+    }
+    fn taskDone(context: *anyopaque) bool {
+        const task: *executor.Task = @ptrCast(@alignCast(context));
+        return switch (task.status()) {
+            .completed, .failed, .cancelled => true,
+            else => false,
+        };
+    }
+    fn nowNs() u64 {
+        return @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds);
     }
     /// Allocates an entity in the empty archetype.
     pub fn create(self: *World) !entity.Entity {
@@ -235,14 +387,14 @@ pub const World = struct {
         return self.findOrCreateArchetype(&copy);
     }
     pub fn beginChunkBorrow(self: *World) void {
-        self.active_chunk_borrows += 1;
+        _ = self.active_chunk_borrows.fetchAdd(1, .acq_rel);
     }
     pub fn endChunkBorrow(self: *World) void {
-        std.debug.assert(self.active_chunk_borrows > 0);
-        self.active_chunk_borrows -= 1;
+        const previous = self.active_chunk_borrows.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
     }
     fn ensureNoChunkBorrows(self: *const World) error{ActiveChunkBorrow}!void {
-        if (builtin.mode == .Debug and self.active_chunk_borrows != 0) return error.ActiveChunkBorrow;
+        if (builtin.mode == .Debug and self.active_chunk_borrows.load(.acquire) != 0) return error.ActiveChunkBorrow;
     }
 };
 
@@ -360,4 +512,32 @@ test "failed create and migration leave the old entity state usable" {
     try std.testing.expectEqual(@as(i32, 7), retained.x);
     try std.testing.expectEqual(@as(i32, 11), retained.y);
     world.allocator = std.testing.allocator;
+}
+
+const SchedulerProbe = struct { ranges: std.atomic.Value(u32) = .init(0) };
+fn incrementSystem(context: *system.SystemContext, maybe_view: ?*query.ChunkView) anyerror!void {
+    const probe = try context.resource(1, SchedulerProbe);
+    const view = maybe_view orelse return;
+    const values = try view.write(context.desc.query.write[0], Position);
+    for (values) |*value| value.x += 1;
+    _ = probe.ranges.fetchAdd(1, .acq_rel);
+}
+
+test "scheduler splits matching chunks into ranges and executes through the compute executor" {
+    var world = try World.init(std.testing.allocator, .{ .chunk_bytes = 2048 });
+    defer world.deinit();
+    const position = try world.registerComponent(Position, "test.ecs.scheduler-position");
+    var probe = SchedulerProbe{};
+    try world.registerResource(1, @ptrCast(&probe));
+    var entities: [600]entity.Entity = undefined;
+    for (&entities) |*value| {
+        value.* = try world.create();
+        try world.add(value.*, position, Position{ .x = 0, .y = 0 });
+    }
+    try world.registerSystem(.{ .id = 7, .name = "increment", .component_writes = &.{position}, .resource_writes = &.{1}, .query = .{ .required = &.{position}, .write = &.{position} }, .grain = 32, .run_fn = incrementSystem });
+    var pool = try executor.FixedPool.init(std.testing.allocator, 2, 128);
+    defer pool.deinit();
+    try world.update(.{ .compute = pool.executor() }, 1.0);
+    try std.testing.expect(probe.ranges.load(.acquire) > 1);
+    for (entities) |value| try std.testing.expectEqual(@as(i32, 1), (try world.get(value, position, Position)).x);
 }

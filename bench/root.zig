@@ -26,9 +26,7 @@ const Probe = struct {
 
 pub fn main() void {
     const allocator = std.heap.page_allocator;
-    const work_ns = [_]u64{ 0, 1_000, 10_000, 100_000, 1_000_000 };
-    for (work_ns) |duration| runWorkload(allocator, duration);
-    runParallelFor(allocator);
+    runEcsScheduler(allocator);
 }
 
 const ParallelBench = struct {
@@ -50,7 +48,7 @@ fn runParallelFor(allocator: std.mem.Allocator) void {
 }
 
 fn runWorkload(allocator: std.mem.Allocator, work_ns: u64) void {
-    var executor = spindle.executor.WorkStealingExecutor.init(allocator, .{ .workers = 2, .local_capacity = 256, .injection_capacity = 2048, .urgent_capacity = 64 }) catch return;
+    var executor = spindle.executor.FixedPool.init(allocator, 2, 2048) catch return;
     defer executor.deinit();
     const count: usize = 512;
     const tasks = allocator.alloc(spindle.executor.Task, count) catch return;
@@ -69,7 +67,37 @@ fn runWorkload(allocator: std.mem.Allocator, work_ns: u64) void {
     const elapsed: u64 = @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds - started.raw.nanoseconds);
     std.sort.pdq(u64, latencies, {}, std.sort.asc(u64));
     const throughput = @as(u64, @intCast(count)) * std.time.ns_per_s / @max(@as(u64, 1), elapsed);
-    std.debug.print("{{\"benchmark\":\"work_stealing\",\"work_ns\":{d},\"samples\":{d},\"throughput\":{d},\"latency_ns\":{d},\"p50_ns\":{d},\"p95_ns\":{d},\"p99_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ work_ns, count, throughput, elapsed / @as(u64, @intCast(count)), percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99), @tagName(builtin.os.tag) });
+    std.debug.print("{{\"benchmark\":\"fixed_pool\",\"work_ns\":{d},\"samples\":{d},\"throughput\":{d},\"latency_ns\":{d},\"p50_ns\":{d},\"p95_ns\":{d},\"p99_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ work_ns, count, throughput, elapsed / @as(u64, @intCast(count)), percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99), @tagName(builtin.os.tag) });
+}
+
+const EcsPosition = struct { value: u32 };
+const EcsProbe = struct { ranges: std.atomic.Value(u64) = .init(0) };
+fn ecsIncrement(context: *spindle.ecs.SystemContext, maybe_view: ?*spindle.ecs.query.ChunkView) anyerror!void {
+    const probe = try context.resource(1, EcsProbe);
+    const view = maybe_view orelse return;
+    const values = try view.write(context.desc.query.write[0], EcsPosition);
+    for (values) |*value| value.value += 1;
+    _ = probe.ranges.fetchAdd(1, .monotonic);
+}
+fn runEcsScheduler(allocator: std.mem.Allocator) void {
+    var world = spindle.ecs.World.init(allocator, .{ .chunk_bytes = 16 * 1024 }) catch return;
+    defer world.deinit();
+    const position = world.registerComponent(EcsPosition, "bench.ecs.position") catch return;
+    var probe = EcsProbe{};
+    world.registerResource(1, @ptrCast(&probe)) catch return;
+    var created: usize = 0;
+    while (created < 16_384) : (created += 1) {
+        const value = world.create() catch return;
+        world.add(value, position, EcsPosition{ .value = 0 }) catch return;
+    }
+    world.registerSystem(.{ .id = 1, .name = "bench_increment", .component_writes = &.{position}, .resource_writes = &.{1}, .query = .{ .required = &.{position}, .write = &.{position} }, .grain = 256, .run_fn = ecsIncrement }) catch return;
+    var pool = spindle.executor.FixedPool.init(allocator, 2, 256) catch return;
+    defer pool.deinit();
+    const started = std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake);
+    world.update(.{ .compute = pool.executor() }, 1.0) catch return;
+    const elapsed: u64 = @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds - started.raw.nanoseconds);
+    const throughput = @as(u64, 16_384) * std.time.ns_per_s / @max(@as(u64, 1), elapsed);
+    std.debug.print("{{\"benchmark\":\"ecs_scheduler\",\"entities\":16384,\"chunk_range_jobs\":{d},\"throughput\":{d},\"elapsed_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ probe.ranges.load(.acquire), throughput, elapsed, @tagName(builtin.os.tag) });
 }
 
 fn percentile(values: []const u64, percent: usize) u64 {

@@ -16,9 +16,18 @@ pub const query = @import("query.zig");
 pub const command_buffer = @import("command_buffer.zig");
 /// Immediate and frame-scoped event channels.
 pub const event = @import("event.zig");
+/// ECS system declarations and singleton access registry.
+pub const system = @import("system.zig");
+/// ECS access-hazard schedule compiler.
+pub const schedule = @import("schedule.zig");
 pub const Entity = entity.Entity;
 pub const ComponentTypeId = component_registry.ComponentTypeId;
 pub const World = world.World;
 pub const Query = query.Query;
 pub const QueryPlan = query.QueryPlan;
 pub const CommandQueue = command_buffer.CommandQueue;
+pub const SystemId = system.SystemId;
+pub const SystemDesc = system.SystemDesc;
+pub const SystemContext = system.SystemContext;
+pub const Phase = system.Phase;
+pub const Target = system.Target;

@@ -92,7 +92,7 @@ pub const Iterator = struct {
             self.chunk_index += 1;
             if (value.count == 0 or !self.plan.changedMatches(value)) continue;
             self.world.beginChunkBorrow();
-            return .{ .world = self.world, .chunk = value, .query = self.plan.query };
+            return .{ .world = self.world, .chunk = value, .query = self.plan.query, .start = 0, .end = value.count };
         }
         return null;
     }
@@ -103,23 +103,25 @@ pub const ChunkView = struct {
     world: *World,
     chunk: *Chunk,
     query: Query,
+    start: usize = 0,
+    end: usize = 0,
     pub fn deinit(self: *ChunkView) void {
         self.world.endChunkBorrow();
         self.* = undefined;
     }
     pub fn entities(self: *const ChunkView) []const @import("entity.zig").Entity {
-        return self.chunk.entities()[0..self.chunk.count];
+        return self.chunk.entities()[self.start..self.end];
     }
     pub fn read(self: *const ChunkView, id: ComponentTypeId, comptime T: type) Error![]const T {
         if (!contains(self.query.required, id) and !contains(self.query.optional, id) and !contains(self.query.read, id)) return error.MissingColumn;
         const col = self.chunk.column(id) orelse return error.MissingColumn;
-        return @as([*]const T, @ptrCast(@alignCast(self.chunk.storage.ptr + col.offset)))[0..self.chunk.count];
+        return @as([*]const T, @ptrCast(@alignCast(self.chunk.storage.ptr + col.offset)))[self.start..self.end];
     }
     pub fn write(self: *ChunkView, id: ComponentTypeId, comptime T: type) Error![]T {
         if (!contains(self.query.write, id)) return error.UndeclaredWrite;
         const col = self.chunk.column(id) orelse return error.MissingColumn;
         self.chunk.markChanged(id, self.world.change_tick);
-        return @as([*]T, @ptrCast(@alignCast(self.chunk.storage.ptr + col.offset)))[0..self.chunk.count];
+        return @as([*]T, @ptrCast(@alignCast(self.chunk.storage.ptr + col.offset)))[self.start..self.end];
     }
 };
 

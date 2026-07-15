@@ -53,7 +53,12 @@ pub fn forRange(allocator: std.mem.Allocator, target: executor.Executor, range: 
         task.* = executor.Task.init(State.run, &state);
         try scope.spawn(task);
     }
-    try scope.wait();
+    const scope_result = scope.wait();
+    // Scope completion runs before a worker releases its intrusive queue
+    // reference. `tasks` is caller-owned, so retain it until all workers have
+    // released those references, including after cancellation.
+    for (tasks) |*task| try task.waitQueueReleased();
+    try scope_result;
 }
 
 /// Applies `body(context, item, index, token)` over a slice using `forRange`.
