@@ -9,6 +9,7 @@ pub const dependency_builder = @import("dependency_builder.zig");
 pub const plan = @import("plan.zig");
 pub const budget = @import("budget.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const incremental_scheduler = @import("incremental_scheduler.zig");
 pub const commit = @import("commit.zig");
 /// Incremental execution cache primitives.
 pub const cache = @import("cache.zig");
@@ -33,6 +34,8 @@ pub const ResourceCost = budget.ResourceCost;
 pub const ExecutionBudget = budget.ExecutionBudget;
 pub const ResourceExecutionHandle = scheduler.ExecutionHandle;
 pub const ResourceSchedulerMetrics = scheduler.Metrics;
+pub const IncrementalResourceScheduler = incremental_scheduler.Scheduler;
+pub const IncrementalResourceSubmission = incremental_scheduler.Submission;
 pub const CommitGroup = commit.CommitGroup;
 pub const CommitPolicy = commit.CommitPolicy;
 pub const CommitStore = commit.Store;
