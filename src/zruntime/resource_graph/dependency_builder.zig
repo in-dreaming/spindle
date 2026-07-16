@@ -30,11 +30,11 @@ pub const ResourceTaskGraph = struct {
     }
     pub fn addAccess(self: *ResourceTaskGraph, id: plan.ResourceNodeId, declaration: access.ResourceAccess) !void {
         try declaration.validate();
-        try self.node(id).accesses.append(self.allocator, declaration);
+        try (try self.node(id)).accesses.append(self.allocator, declaration);
     }
     pub fn dependsOn(self: *ResourceTaskGraph, dependent: plan.ResourceNodeId, dependency: plan.ResourceNodeId) !void {
         _ = try self.node(dependency);
-        try self.node(dependent).explicit.append(self.allocator, dependency);
+        try (try self.node(dependent)).explicit.append(self.allocator, dependency);
     }
     fn node(self: *ResourceTaskGraph, id: plan.ResourceNodeId) !*Draft {
         if (id.value == 0 or id.value > self.nodes.items.len) return error.InvalidNodeId;
