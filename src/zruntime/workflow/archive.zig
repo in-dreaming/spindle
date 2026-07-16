@@ -8,6 +8,20 @@ pub const Record = struct { sequence: u64, kind: u32, utc_ms: i64, schema: core.
 pub const Manifest = struct { first_sequence: u64, last_sequence: u64, record_count: u64, checksum: u64 };
 pub const max_archive_bytes: usize = 16 * 1024 * 1024;
 
+/// Type-erased archive storage contract shared by local and remote adapters.
+pub const Storage = struct {
+    context: *anyopaque,
+    put_fn: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+    get_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
+
+    pub fn put(self: Storage, location: []const u8, bytes: []const u8) !void {
+        try self.put_fn(self.context, location, bytes);
+    }
+    pub fn get(self: Storage, allocator: std.mem.Allocator, location: []const u8) ![]u8 {
+        return self.get_fn(self.context, allocator, location);
+    }
+};
+
 /// Encodes records in canonical sequence order. Callers must verify before publishing a manifest.
 pub fn encode(allocator: std.mem.Allocator, records: []const Record) ![]u8 {
     if (records.len == 0) return error.EmptyArchive;
@@ -43,6 +57,7 @@ pub fn encode(allocator: std.mem.Allocator, records: []const Record) ![]u8 {
 pub fn verify(bytes: []const u8) !Manifest {
     if (bytes.len < 20 or !std.mem.eql(u8, bytes[0..4], "SPAR") or std.mem.readInt(u32, bytes[4..8], .big) != format_version) return error.InvalidArchive;
     const count = std.mem.readInt(u32, bytes[8..12], .big);
+    if (count == 0) return error.EmptyArchive;
     const trailer: *const [8]u8 = @ptrCast(bytes.ptr + bytes.len - 8);
     const wanted = std.mem.readInt(u64, trailer, .big);
     if (core.hash.content(bytes[0 .. bytes.len - 8]) != wanted) return error.ChecksumMismatch;
@@ -99,6 +114,9 @@ fn readInt(comptime T: type, bytes: []const u8, offset: usize) T {
 pub const LocalArtifactStore = struct {
     io: std.Io,
     directory: []const u8,
+    pub fn storage(self: *LocalArtifactStore) Storage {
+        return .{ .context = self, .put_fn = erasedPut, .get_fn = erasedGet };
+    }
     pub fn put(self: LocalArtifactStore, location: []const u8, bytes: []const u8) !void {
         try std.Io.Dir.cwd().createDirPath(self.io, self.directory);
         var final_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -126,10 +144,18 @@ pub const LocalArtifactStore = struct {
         defer allocator.free(buffer);
         return allocator.dupe(u8, try std.Io.Dir.cwd().readFile(self.io, path, buffer));
     }
+    fn erasedPut(context: *anyopaque, location: []const u8, bytes: []const u8) anyerror!void {
+        const self: *LocalArtifactStore = @ptrCast(@alignCast(context));
+        try self.put(location, bytes);
+    }
+    fn erasedGet(context: *anyopaque, allocator: std.mem.Allocator, location: []const u8) anyerror![]u8 {
+        const self: *LocalArtifactStore = @ptrCast(@alignCast(context));
+        return self.get(allocator, location);
+    }
 };
 
 /// Archives one eligible completed workflow after durable write and read-back verification.
-pub fn archiveCompleted(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: anytype, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, retention_before_utc_ms: i64) !Manifest {
+pub fn archiveCompleted(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: Storage, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, retention_before_utc_ms: i64) !Manifest {
     const hot = try store.readHistory(allocator, tenant, namespace, workflow_id);
     defer {
         for (hot) |record| allocator.free(record.payload);
@@ -155,7 +181,7 @@ pub fn archiveCompleted(allocator: std.mem.Allocator, store: *sqlite.Store, arti
 }
 
 /// Reads verified archives plus the hot tail and rejects gaps before replay.
-pub fn readHistory(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: anytype, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, max_events: usize) ![]Record {
+pub fn readHistory(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: Storage, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, max_events: usize) ![]Record {
     const manifests = try store.archiveRecords(allocator, tenant, namespace, workflow_id);
     defer {
         for (manifests) |item| allocator.free(item.location);

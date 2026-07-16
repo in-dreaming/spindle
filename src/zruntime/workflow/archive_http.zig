@@ -1,5 +1,6 @@
 const std = @import("std");
 const resource_graph = @import("../resource_graph/root.zig");
+const archive = @import("archive.zig");
 
 /// HTTP archive facade. Locations are canonical lowercase SHA-256 CAS keys.
 pub const ArtifactStore = struct {
@@ -7,6 +8,9 @@ pub const ArtifactStore = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, endpoint: []const u8) ArtifactStore {
         return .{ .remote = resource_graph.cache.ArtifactStore.init(allocator, io, endpoint) };
+    }
+    pub fn storage(self: *ArtifactStore) archive.Storage {
+        return .{ .context = self, .put_fn = erasedPut, .get_fn = erasedGet };
     }
     pub fn put(self: ArtifactStore, location: []const u8, bytes: []const u8) !void {
         const key = try parseLocation(location);
@@ -28,5 +32,13 @@ pub const ArtifactStore = struct {
             byte.* = @intCast(high * 16 + low);
         }
         return result;
+    }
+    fn erasedPut(context: *anyopaque, location: []const u8, bytes: []const u8) anyerror!void {
+        const self: *ArtifactStore = @ptrCast(@alignCast(context));
+        try self.put(location, bytes);
+    }
+    fn erasedGet(context: *anyopaque, allocator: std.mem.Allocator, location: []const u8) anyerror![]u8 {
+        const self: *ArtifactStore = @ptrCast(@alignCast(context));
+        return self.get(allocator, location);
     }
 };

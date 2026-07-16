@@ -35,8 +35,8 @@ test "verified local archive preserves hot history until manifest commit and com
     var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, path, clock.clock());
     const client = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next } };
     const workflow_id = try client.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "archive" }, .tenant = "archive", .namespace = "test", .idempotency_key = "start", .utc_ms = 5000 });
-    const artifacts = spindle.workflow.archive.LocalArtifactStore{ .io = std.Options.debug_io, .directory = directory };
-    try std.testing.expectError(error.Conflict, spindle.workflow.archive.archiveCompleted(std.testing.allocator, &store, artifacts, "archive", "test", workflow_id, 5000));
+    var artifacts = spindle.workflow.archive.LocalArtifactStore{ .io = std.Options.debug_io, .directory = directory };
+    try std.testing.expectError(error.Conflict, spindle.workflow.archive.archiveCompleted(std.testing.allocator, &store, artifacts.storage(), "archive", "test", workflow_id, 5000));
     const hot = try store.readHistory(std.testing.allocator, "archive", "test", workflow_id);
     defer {
         for (hot) |record| std.testing.allocator.free(record.payload);
@@ -64,7 +64,7 @@ test "verified local archive preserves hot history until manifest commit and com
         std.testing.allocator.free(still_hot);
     }
     try std.testing.expectEqual(@as(usize, 2), still_hot.len);
-    const manifest = try spindle.workflow.archive.archiveCompleted(std.testing.allocator, &store, artifacts, "archive", "test", workflow_id, 5000);
+    const manifest = try spindle.workflow.archive.archiveCompleted(std.testing.allocator, &store, artifacts.storage(), "archive", "test", workflow_id, 5000);
     try std.testing.expectEqual(@as(u64, 2), manifest.record_count);
     try std.testing.expectError(error.NotFound, store.readHistory(std.testing.allocator, "archive", "test", workflow_id));
     store.deinit();
@@ -73,7 +73,7 @@ test "verified local archive preserves hot history until manifest commit and com
     const health = try reopened.health();
     try std.testing.expectEqual(@as(u64, 0), health.history_gaps);
     try std.testing.expectEqual(spindle.workflow.store_health.Integrity.healthy, health.integrity);
-    const composed = try spindle.workflow.archive.readHistory(std.testing.allocator, &reopened, artifacts, "archive", "test", workflow_id, 16);
+    const composed = try spindle.workflow.archive.readHistory(std.testing.allocator, &reopened, artifacts.storage(), "archive", "test", workflow_id, 16);
     defer spindle.workflow.archive.deinitRecords(std.testing.allocator, composed);
     try std.testing.expectEqual(@as(usize, 2), composed.len);
     try std.testing.expectEqual(spindle.workflow.event.Kind.started, composed[0].kind);

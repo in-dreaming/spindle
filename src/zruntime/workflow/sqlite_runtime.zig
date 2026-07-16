@@ -64,33 +64,51 @@ pub const WorkflowRuntime = struct {
 
 /// Owns all single-process SQLite workflow loops. Every loop is joined during shutdown.
 pub const WorkflowSubsystem = struct {
+    allocator: std.mem.Allocator,
     workflow: sqlite_worker.Worker,
     activities: activity_worker.Worker,
     timers: timer_worker.Worker,
     publisher: outbox.Publisher,
+    counts: [4]usize,
     stopping: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     activity_cancel: executor.CancellationSource = .{},
     idle_word: std.atomic.Value(u32) = .init(0),
-    done: [4]sync.Event = .{ sync.Event.init(.manual, false), sync.Event.init(.manual, false), sync.Event.init(.manual, false), sync.Event.init(.manual, false) },
-    threads: [4]?std.Thread = .{ null, null, null, null },
+    done: []sync.Event = &.{},
+    threads: []?std.Thread = &.{},
 
     pub fn init(workflow: sqlite_worker.Worker, activities: activity_worker.Worker, timers: timer_worker.Worker, publisher: outbox.Publisher) WorkflowSubsystem {
-        return .{ .workflow = workflow, .activities = activities, .timers = timers, .publisher = publisher };
+        return initConfigured(std.heap.page_allocator, workflow, activities, timers, publisher, .{ 1, 1, 1, 1 });
+    }
+    pub fn initConfigured(allocator: std.mem.Allocator, workflow: sqlite_worker.Worker, activities: activity_worker.Worker, timers: timer_worker.Worker, publisher: outbox.Publisher, counts: [4]usize) WorkflowSubsystem {
+        return .{ .allocator = allocator, .workflow = workflow, .activities = activities, .timers = timers, .publisher = publisher, .counts = counts };
     }
     pub fn deinit(self: *WorkflowSubsystem) void {
         self.shutdown(null) catch {};
+        self.allocator.free(self.threads);
+        self.allocator.free(self.done);
         self.* = undefined;
     }
     /// Starts every worker; a thread-creation failure cancels and joins workers already started.
     pub fn start(self: *WorkflowSubsystem) !void {
-        if (self.threads[0] != null) return error.AlreadyStarted;
+        for (self.threads) |thread| if (thread != null) return error.AlreadyStarted;
+        if (self.threads.len == 0) {
+            const total = self.counts[0] + self.counts[1] + self.counts[2] + self.counts[3];
+            self.threads = try self.allocator.alloc(?std.Thread, total);
+            errdefer {
+                self.allocator.free(self.threads);
+                self.threads = &.{};
+            }
+            self.done = try self.allocator.alloc(sync.Event, total);
+            @memset(self.threads, null);
+            for (self.done) |*value| value.* = sync.Event.init(.manual, false);
+        }
         self.stopping.store(false, .release);
         self.failed.store(false, .release);
         self.activity_cancel = .{};
         self.activities.shutdown = self.activity_cancel.token();
-        for (&self.done) |*value| value.reset();
-        inline for (0..4) |index| self.threads[index] = std.Thread.spawn(.{}, run, .{ self, index }) catch |err| {
+        for (self.done) |*value| value.reset();
+        for (self.threads, 0..) |*thread, index| thread.* = std.Thread.spawn(.{}, run, .{ self, index }) catch |err| {
             self.stopping.store(true, .release);
             self.activity_cancel.cancel();
             _ = self.idle_word.fetchAdd(1, .release);
@@ -111,11 +129,11 @@ pub const WorkflowSubsystem = struct {
         platform.park.wakeAll(&self.idle_word.raw);
     }
     pub fn wait(self: *WorkflowSubsystem, deadline: ?platform.park.Deadline) !void {
-        if (self.threads[0] == null) {
+        if (self.outstanding() == 0) {
             if (self.failed.load(.acquire)) return error.WorkerFailed;
             return;
         }
-        for (&self.done) |*value| value.wait(deadline, .{}) catch |err| switch (err) {
+        for (self.done) |*value| value.wait(deadline, .{}) catch |err| switch (err) {
             error.Timeout => return error.Timeout,
             else => return err,
         };
@@ -130,21 +148,25 @@ pub const WorkflowSubsystem = struct {
         return count;
     }
     fn joinStarted(self: *WorkflowSubsystem) void {
-        for (&self.threads) |*thread| if (thread.*) |value| {
+        for (self.threads) |*thread| if (thread.*) |value| {
             value.join();
             thread.* = null;
         };
     }
     fn run(self: *WorkflowSubsystem, index: usize) void {
         defer self.done[index].set();
+        const activity_start = self.counts[0];
+        const timer_start = activity_start + self.counts[1];
+        const publisher_start = timer_start + self.counts[2];
         while (!self.stopping.load(.acquire)) {
-            const worked = switch (index) {
-                0 => self.workflow.runOne(),
-                1 => self.activities.runOne(),
-                2 => self.timers.runOne(),
-                3 => self.publisher.runOne(),
-                else => false,
-            } catch {
+            const worked = (if (index < activity_start)
+                self.workflow.runOne()
+            else if (index < timer_start)
+                self.activities.runOne()
+            else if (index < publisher_start)
+                self.timers.runOne()
+            else
+                self.publisher.runOne()) catch {
                 self.failed.store(true, .release);
                 return;
             };

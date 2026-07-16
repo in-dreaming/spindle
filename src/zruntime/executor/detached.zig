@@ -66,20 +66,8 @@ pub const DetachedTracker = struct {
     pub fn wait(self: *DetachedTracker, deadline: ?park.Deadline) error{Timeout}!void {
         const state = self.state orelse return;
         state.lock.lock();
-        const snapshot = self.allocator.alloc(*Allocation, state.allocations.items.len) catch {
-            state.lock.unlock();
-            return error.Timeout;
-        };
-        for (state.allocations.items, 0..) |allocation, index| {
-            allocation.retain();
-            snapshot[index] = allocation;
-        }
-        state.lock.unlock();
-        defer {
-            for (snapshot) |allocation| allocation.release();
-            self.allocator.free(snapshot);
-        }
-        for (snapshot) |allocation| {
+        defer state.lock.unlock();
+        for (state.allocations.items) |allocation| {
             allocation.task.done.wait(deadline, .{}) catch return error.Timeout;
         }
     }
@@ -102,11 +90,14 @@ pub const DetachedTracker = struct {
         while (true) {
             state.lock.lock();
             const allocation = if (state.allocations.items.len == 0) null else state.allocations.pop();
-            state.lock.unlock();
-            const value = allocation orelse break;
+            const value = allocation orelse {
+                state.lock.unlock();
+                break;
+            };
             value.link_lock.lock();
             if (value.tracker == state) value.tracker = null;
             value.link_lock.unlock();
+            state.lock.unlock();
             value.release();
         }
         self.state = null;
@@ -144,15 +135,19 @@ pub const DetachedHandle = struct {
         allocation.link_lock.lock();
         const state = allocation.tracker;
         if (state) |value| value.retain();
-        allocation.tracker = null;
         allocation.link_lock.unlock();
         if (state) |value| {
             value.lock.lock();
-            for (value.allocations.items, 0..) |item, index| if (item == allocation) {
-                _ = value.allocations.swapRemove(index);
-                allocation.release();
-                break;
-            };
+            allocation.link_lock.lock();
+            if (allocation.tracker == value) {
+                allocation.tracker = null;
+                for (value.allocations.items, 0..) |item, index| if (item == allocation) {
+                    _ = value.allocations.swapRemove(index);
+                    allocation.release();
+                    break;
+                };
+            }
+            allocation.link_lock.unlock();
             value.lock.unlock();
             value.release();
         }

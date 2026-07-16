@@ -506,6 +506,22 @@ test "detached tracker may release before a live handle and queued reference" {
     handle.deinit();
 }
 
+test "detached shutdown wait performs no snapshot allocation" {
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 2);
+    defer pump.deinit();
+    var tracker = spindle.executor.DetachedTracker.init(std.testing.allocator);
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var handle = try spindle.executor.submitTrackedDetached(&tracker, std.testing.allocator, pump.executor(), TaskProbe.run, &probe);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    tracker.allocator = failing.allocator();
+    tracker.requestStop();
+    try tracker.wait(null);
+    tracker.deinit();
+    pump.shutdown(.cancel_pending);
+    handle.deinit();
+}
+
 const WorkerIdentityProbe = struct {
     pool: *spindle.executor.FixedPool,
     observed: *std.atomic.Value(bool),

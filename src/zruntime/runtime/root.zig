@@ -19,7 +19,7 @@ pub const Features = struct {
     pub const workflow_archive_http = build_options.workflow_archive_http;
 };
 
-pub const WorkflowConfig = if (build_options.workflow_sqlite) struct {
+const WorkflowConfig = struct {
     database_path: []const u8,
     tenant: []const u8,
     namespace: []const u8,
@@ -27,25 +27,39 @@ pub const WorkflowConfig = if (build_options.workflow_sqlite) struct {
     activities: []const workflow.activity.Registration,
     /// The callback context remains borrowed from the caller for the Runtime lifetime.
     transport: workflow.outbox.Transport,
+    workflow_workers: usize = 1,
+    activity_workers: usize = 1,
+    timer_workers: usize = 1,
+    publisher_workers: usize = 1,
     command_capacity: usize = 64,
-} else struct {};
+};
 
-pub const Config = struct {
+const BaseConfig = struct {
     io: std.Io,
     compute_workers: usize = 1,
     blocking_workers: usize = 1,
     queue_capacity: usize = 64,
     observability_capacity: usize = 128,
-    workflow: if (build_options.workflow_sqlite) ?WorkflowConfig else void = if (build_options.workflow_sqlite) null else {},
     fault: Fault = .none,
 };
+pub const Config = if (build_options.workflow_sqlite) struct {
+    io: std.Io,
+    compute_workers: usize = 1,
+    blocking_workers: usize = 1,
+    queue_capacity: usize = 64,
+    observability_capacity: usize = 128,
+    workflow: ?WorkflowConfig = null,
+    fault: Fault = .none,
+} else BaseConfig;
 
 pub const ShutdownStage = enum { workflow, pump, detached, blocking, compute };
 pub const ShutdownReport = struct {
     completed: bool,
     timed_out_stage: ?ShutdownStage = null,
+    failed_stage: ?ShutdownStage = null,
     outstanding_workflow_workers: usize = 0,
     outstanding_executor_workers: usize = 0,
+    outstanding_pump_work: usize = 0,
     outstanding_detached: usize,
     dropped_events: u64,
 };
@@ -135,12 +149,15 @@ const WorkflowOwned = if (build_options.workflow_sqlite) struct {
             try self.activities.register(copied);
         }
         self.activities.freeze();
-        self.subsystem = workflow.sqlite_runtime.WorkflowSubsystem.init(
+        self.subsystem = workflow.sqlite_runtime.WorkflowSubsystem.initConfigured(
+            allocator,
             .{ .allocator = allocator, .store = &self.store, .registry = &self.definitions, .tenant = self.tenant, .namespace = self.namespace, .command_capacity = config.command_capacity },
             .{ .allocator = allocator, .store = &self.store, .registry = &self.activities, .tenant = self.tenant, .namespace = self.namespace, .compute = compute.executor(), .blocking = blocking.executor() },
             .{ .allocator = allocator, .store = &self.store, .tenant = self.tenant, .namespace = self.namespace },
             .{ .allocator = allocator, .store = &self.store, .tenant = self.tenant, .namespace = self.namespace, .transport = config.transport },
+            .{ config.workflow_workers, config.activity_workers, config.timer_workers, config.publisher_workers },
         );
+        errdefer self.subsystem.deinit();
         try self.subsystem.start();
         return self;
     }
@@ -241,32 +258,37 @@ pub const Runtime = struct {
 
     pub fn shutdown(self: *Runtime, deadline_monotonic_ns: ?u64) ShutdownReport {
         const state = self.state;
-        if (state.stopped) return self.shutdownReport(true, null);
-        if (deadline_monotonic_ns) |deadline_value| if (self.clock().monotonicNow() >= deadline_value) return self.shutdownReport(false, .workflow);
-        const deadline = if (deadline_monotonic_ns) |value| platform.park.deadlineAfter(value - self.clock().monotonicNow()) else null;
-        if (build_options.workflow_sqlite) if (state.workflow) |owned| {
-            owned.subsystem.requestStop();
-            owned.subsystem.wait(deadline) catch return self.shutdownReport(false, .workflow);
-        };
-        state.pump.shutdown(.drain);
-        if (platform.park.expired(deadline)) return self.shutdownReport(false, .pump);
+        if (state.stopped) return self.shutdownReport(true, null, null);
+        const now = self.clock().monotonicNow();
+        const expired = if (deadline_monotonic_ns) |value| now >= value else false;
+        const deadline = if (deadline_monotonic_ns) |value| platform.park.deadlineAfter(if (value > now) value - now else 0) else null;
+        if (build_options.workflow_sqlite) if (state.workflow) |owned| owned.subsystem.requestStop();
         state.detached.requestStop();
         state.blocking.requestStop(.cancel_pending);
         state.compute.requestStop(.cancel_pending);
-        state.detached.wait(deadline) catch return self.shutdownReport(false, .detached);
-        state.blocking.wait(deadline) catch return self.shutdownReport(false, .blocking);
-        state.compute.wait(deadline) catch return self.shutdownReport(false, .compute);
+        state.pump.shutdown(if (deadline_monotonic_ns == null) .drain else .cancel_pending);
+        if (expired) return self.shutdownReport(false, if (build_options.workflow_sqlite and state.workflow != null) .workflow else .pump, null);
+        if (build_options.workflow_sqlite) if (state.workflow) |owned| owned.subsystem.wait(deadline) catch |err| return switch (err) {
+            error.Timeout => self.shutdownReport(false, .workflow, null),
+            else => self.shutdownReport(false, null, .workflow),
+        };
+        if (platform.park.expired(deadline)) return self.shutdownReport(false, .pump, null);
+        state.detached.wait(deadline) catch return self.shutdownReport(false, .detached, null);
+        state.blocking.wait(deadline) catch return self.shutdownReport(false, .blocking, null);
+        state.compute.wait(deadline) catch return self.shutdownReport(false, .compute, null);
         state.stopped = true;
-        return self.shutdownReport(true, null);
+        return self.shutdownReport(true, null, null);
     }
 
-    fn shutdownReport(self: *Runtime, completed: bool, stage: ?ShutdownStage) ShutdownReport {
+    fn shutdownReport(self: *Runtime, completed: bool, timeout_stage: ?ShutdownStage, failed_stage: ?ShutdownStage) ShutdownReport {
         const state = self.state;
         return .{
             .completed = completed,
-            .timed_out_stage = stage,
+            .timed_out_stage = timeout_stage,
+            .failed_stage = failed_stage,
             .outstanding_workflow_workers = if (build_options.workflow_sqlite) if (state.workflow) |owned| owned.subsystem.outstanding() else 0 else 0,
             .outstanding_executor_workers = state.blocking.outstandingWorkers() + state.compute.outstandingWorkers(),
+            .outstanding_pump_work = state.pump.outstanding(),
             .outstanding_detached = state.detached.outstanding(),
             .dropped_events = state.event_ring.droppedCount(),
         };

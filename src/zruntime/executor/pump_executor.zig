@@ -6,6 +6,7 @@ const MpmcQueue = @import("../concurrent/mpmc_queue.zig").MpmcQueue;
 pub const PumpExecutor = struct {
     queue: MpmcQueue(*Task),
     accepting: bool = true,
+    pending: std.atomic.Value(usize) = .init(0),
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !PumpExecutor {
         return .{ .queue = try MpmcQueue(*Task).init(allocator, capacity) };
     }
@@ -20,13 +21,17 @@ pub const PumpExecutor = struct {
         if (!self.accepting) return error.Shutdown;
         if (!task.tryQueue()) return error.DuplicateSubmission;
         task.retainQueueReference();
+        _ = self.pending.fetchAdd(1, .release);
         self.queue.tryPush(task) catch |err| switch (err) {
             error.Full => {
+                _ = self.pending.fetchSub(1, .acq_rel);
                 _ = task.state.cmpxchgStrong(.queued, .created, .acq_rel, .acquire);
                 task.releaseQueueReference();
                 return error.Backpressure;
             },
             error.Closed => {
+                _ = self.pending.fetchSub(1, .acq_rel);
+                _ = task.state.cmpxchgStrong(.queued, .created, .acq_rel, .acquire);
                 task.releaseQueueReference();
                 return error.Shutdown;
             },
@@ -36,6 +41,7 @@ pub const PumpExecutor = struct {
         var count: usize = 0;
         while (count < max_tasks) {
             const task = self.queue.tryPop() catch break;
+            _ = self.pending.fetchSub(1, .acq_rel);
             task.execute();
             task.releaseQueueReference();
             count += 1;
@@ -48,6 +54,7 @@ pub const PumpExecutor = struct {
         var count: usize = 0;
         while (count < max_tasks and std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds < deadline.raw.nanoseconds) {
             const task = self.queue.tryPop() catch break;
+            _ = self.pending.fetchSub(1, .acq_rel);
             task.execute();
             task.releaseQueueReference();
             count += 1;
@@ -61,10 +68,14 @@ pub const PumpExecutor = struct {
         if (policy != .drain) {
             while (true) {
                 const task = self.queue.tryPop() catch break;
+                _ = self.pending.fetchSub(1, .acq_rel);
                 _ = task.cancel();
                 task.releaseQueueReference();
             }
         } else _ = self.drain(std.math.maxInt(usize));
+    }
+    pub fn outstanding(self: *const PumpExecutor) usize {
+        return self.pending.load(.acquire);
     }
     fn dispose(task: *Task) void {
         _ = task.cancel();

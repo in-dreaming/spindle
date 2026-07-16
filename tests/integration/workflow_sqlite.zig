@@ -149,6 +149,8 @@ const ProbeActivity = struct {
     }
 };
 
+var probe_activity_test_mutex: spindle.sync.AdaptiveMutex = .{};
+
 const ShutdownActivity = struct {
     var started: std.atomic.Value(bool) = .init(false);
     var release: std.atomic.Value(bool) = .init(false);
@@ -268,7 +270,8 @@ test "child creation completion notification and parent resume are transactional
     try std.testing.expectEqual(@as(u64, 701), child.definition_id);
     try std.testing.expectEqual(@as(u32, 1), child.definition_version);
     var ran: usize = 1;
-    while (try worker.runOne()) : (ran += 1) {}
+    while (ran < 16 and try worker.runOne()) : (ran += 1) {}
+    try std.testing.expect(!(try worker.runOne()));
     try std.testing.expect(ran >= 3);
     const parent = try store.getInstance("child", "test", parent_id);
     defer std.testing.allocator.free(parent.state);
@@ -542,6 +545,8 @@ test "timer outbox and inbox survive restart with send-before-mark duplication" 
 }
 
 test "activity retries are deterministic and non-retryable failures exhaust immediately" {
+    probe_activity_test_mutex.lock();
+    defer probe_activity_test_mutex.unlock();
     const file = ".zig-cache/workflow-activity-retry.db";
     cleanup(file);
     defer cleanup(file);
@@ -585,6 +590,8 @@ test "activity retries are deterministic and non-retryable failures exhaust imme
 }
 
 test "all activity timeout classes and cancellation race record terminal failure" {
+    probe_activity_test_mutex.lock();
+    defer probe_activity_test_mutex.unlock();
     try runActivityFailureScenario("schedule", .complete, .{ .schedule_to_start_ms = 5 }, 5);
     try std.testing.expectEqual(@as(u32, 0), ProbeActivity.calls.load(.acquire));
     try runActivityFailureScenario("start", .start_timeout, .{ .start_to_close_ms = 5 }, 0);
@@ -662,10 +669,40 @@ test "workflow subsystem joins workers and honors shutdown deadline for long act
     var subsystem = spindle.workflow.sqlite_runtime.WorkflowSubsystem.init(workflow_worker, activity_worker, timer_worker, publisher);
     defer subsystem.deinit();
     try subsystem.start();
+    try std.testing.expectEqual(@as(usize, 4), subsystem.outstanding());
     while (!ShutdownActivity.started.load(.acquire)) std.Thread.yield() catch {};
     try std.testing.expectError(error.Timeout, subsystem.shutdown(spindle.platform.park.deadlineAfter(0)));
     ShutdownActivity.release.store(true, .release);
     try subsystem.shutdown(spindle.platform.park.deadlineAfter(std.time.ns_per_s));
+}
+
+test "workflow subsystem supports dynamic worker counts" {
+    const file = ".zig-cache/workflow-subsystem-counts.db";
+    cleanup(file);
+    defer cleanup(file);
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 1301);
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    defer store.deinit();
+    var workflows = spindle.workflow.Registry.init(std.testing.allocator);
+    defer workflows.deinit();
+    workflows.freeze();
+    var activities = spindle.workflow.activity.Registry.init(std.testing.allocator);
+    defer activities.deinit();
+    activities.freeze();
+    var compute = try spindle.executor.FixedPool.init(std.testing.allocator, 1, 8);
+    defer compute.deinit();
+    var blocking = try spindle.executor.BlockingExecutor.init(std.testing.allocator, 1, 8);
+    defer blocking.deinit();
+    const workflow_worker = spindle.workflow.sqlite_worker.Worker{ .allocator = std.testing.allocator, .store = &store, .registry = &workflows, .tenant = "counts", .namespace = "test" };
+    const activity_worker = spindle.workflow.activity_worker.Worker{ .allocator = std.testing.allocator, .store = &store, .registry = &activities, .tenant = "counts", .namespace = "test", .compute = compute.executor(), .blocking = blocking.executor() };
+    const timer_worker = spindle.workflow.timer_worker.Worker{ .allocator = std.testing.allocator, .store = &store, .tenant = "counts", .namespace = "test" };
+    const publisher = spindle.workflow.outbox.Publisher{ .allocator = std.testing.allocator, .store = &store, .tenant = "counts", .namespace = "test", .transport = .{ .context = null, .publish_fn = discardTransport } };
+    var subsystem = spindle.workflow.sqlite_runtime.WorkflowSubsystem.initConfigured(std.testing.allocator, workflow_worker, activity_worker, timer_worker, publisher, .{ 2, 2, 1, 1 });
+    defer subsystem.deinit();
+    try subsystem.start();
+    try std.testing.expectEqual(@as(usize, 6), subsystem.outstanding());
+    try subsystem.shutdown(spindle.platform.park.deadlineAfter(std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 0), subsystem.outstanding());
 }
 
 test "real subprocess activity timer and outbox crash stages recover" {
