@@ -4,11 +4,11 @@ const core = @import("../core/root.zig");
 const executor = @import("../executor/root.zig");
 const io_adapter = @import("../io_adapter/root.zig");
 const observability = @import("../observability/root.zig");
+const platform = @import("../platform/root.zig");
+const workflow = if (build_options.workflow_sqlite) @import("../workflow/root.zig") else struct {};
 
-/// Runtime construction failure injection used only by integration tests.
-pub const Fault = enum { none, clock, compute, blocking, pump, observability };
+pub const Fault = enum { none, clock, compute, blocking, pump, observability, workflow };
 
-/// Compile-time profile values for consumers that need to adapt aggregate APIs.
 pub const Features = struct {
     pub const task_graph = build_options.task_graph;
     pub const ecs = build_options.ecs;
@@ -19,24 +19,37 @@ pub const Features = struct {
     pub const workflow_archive_http = build_options.workflow_archive_http;
 };
 
-/// Runtime resource configuration. The supplied `std.Io` remains owned by the caller.
+pub const WorkflowConfig = if (build_options.workflow_sqlite) struct {
+    database_path: []const u8,
+    tenant: []const u8,
+    namespace: []const u8,
+    definitions: []const workflow.definition.Definition,
+    activities: []const workflow.activity.Registration,
+    /// The callback context remains borrowed from the caller for the Runtime lifetime.
+    transport: workflow.outbox.Transport,
+    command_capacity: usize = 64,
+} else struct {};
+
 pub const Config = struct {
     io: std.Io,
     compute_workers: usize = 1,
     blocking_workers: usize = 1,
     queue_capacity: usize = 64,
     observability_capacity: usize = 128,
+    workflow: if (build_options.workflow_sqlite) ?WorkflowConfig else void = if (build_options.workflow_sqlite) null else {},
     fault: Fault = .none,
 };
 
-/// Result of a completed shutdown. A deadline is reported without releasing live resources.
+pub const ShutdownStage = enum { workflow, pump, detached, blocking, compute };
 pub const ShutdownReport = struct {
     completed: bool,
+    timed_out_stage: ?ShutdownStage = null,
+    outstanding_workflow_workers: usize = 0,
+    outstanding_executor_workers: usize = 0,
     outstanding_detached: usize,
     dropped_events: u64,
 };
 
-/// Public inventory for inspector and replay clients. It contains no persistence internals.
 pub const InspectorProtocol = struct {
     pub const version: u32 = 1;
     pub fn enabledModules() []const []const u8 {
@@ -55,15 +68,106 @@ pub const InspectorProtocol = struct {
     }
 };
 
-/// Stable replay envelope whose module list is limited to the active build profile.
 pub const ReplayBundle = struct {
     format_version: u32 = 1,
     modules: []const []const u8 = InspectorProtocol.enabledModules(),
 };
 
-/// Owns compute, blocking, pump execution, clock, I/O adapter, detached work, and observability.
-/// It starts no upper-module or persistence resource in profiles that omit those features.
-pub const Runtime = struct {
+const WorkflowOwned = if (build_options.workflow_sqlite) struct {
+    allocator: std.mem.Allocator,
+    store: workflow.sqlite.Store,
+    definitions: workflow.definition.Registry,
+    activities: workflow.activity.Registry,
+    tenant: []u8,
+    namespace: []u8,
+    owned_definition_names: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_activity_names: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_activity_ownership: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_non_retryable: std.ArrayListUnmanaged([]u32) = .empty,
+    subsystem: workflow.sqlite_runtime.WorkflowSubsystem,
+
+    fn init(allocator: std.mem.Allocator, config: WorkflowConfig, clock: core.Clock, compute: *executor.FixedPool, blocking: *executor.BlockingExecutor) !*@This() {
+        const self = try allocator.create(@This());
+        errdefer allocator.destroy(self);
+        {
+            const tenant = try allocator.dupe(u8, config.tenant);
+            errdefer allocator.free(tenant);
+            const namespace = try allocator.dupe(u8, config.namespace);
+            errdefer allocator.free(namespace);
+            var store = try workflow.sqlite.Store.init(allocator, config.database_path, clock);
+            errdefer store.deinit();
+            var definitions = workflow.definition.Registry.init(allocator);
+            errdefer definitions.deinit();
+            var activities = workflow.activity.Registry.init(allocator);
+            errdefer activities.deinit();
+            self.* = undefined;
+            self.allocator = allocator;
+            self.store = store;
+            self.definitions = definitions;
+            self.activities = activities;
+            self.tenant = tenant;
+            self.namespace = namespace;
+            self.owned_definition_names = .empty;
+            self.owned_activity_names = .empty;
+            self.owned_activity_ownership = .empty;
+            self.owned_non_retryable = .empty;
+        }
+        errdefer self.deinitMetadata();
+        for (config.definitions) |definition| {
+            const name = try allocator.dupe(u8, definition.stable_name);
+            try self.owned_definition_names.append(allocator, name);
+            var copied = definition;
+            copied.stable_name = name;
+            try self.definitions.register(copied);
+        }
+        self.definitions.freeze();
+        for (config.activities) |registration| {
+            const name = try allocator.dupe(u8, registration.stable_name);
+            try self.owned_activity_names.append(allocator, name);
+            const ownership = try allocator.dupe(u8, registration.ownership);
+            try self.owned_activity_ownership.append(allocator, ownership);
+            const non_retryable = try allocator.dupe(u32, registration.retry_policy.non_retryable);
+            try self.owned_non_retryable.append(allocator, non_retryable);
+            var copied = registration;
+            copied.stable_name = name;
+            copied.ownership = ownership;
+            copied.retry_policy.non_retryable = non_retryable;
+            try self.activities.register(copied);
+        }
+        self.activities.freeze();
+        self.subsystem = workflow.sqlite_runtime.WorkflowSubsystem.init(
+            .{ .allocator = allocator, .store = &self.store, .registry = &self.definitions, .tenant = self.tenant, .namespace = self.namespace, .command_capacity = config.command_capacity },
+            .{ .allocator = allocator, .store = &self.store, .registry = &self.activities, .tenant = self.tenant, .namespace = self.namespace, .compute = compute.executor(), .blocking = blocking.executor() },
+            .{ .allocator = allocator, .store = &self.store, .tenant = self.tenant, .namespace = self.namespace },
+            .{ .allocator = allocator, .store = &self.store, .tenant = self.tenant, .namespace = self.namespace, .transport = config.transport },
+        );
+        try self.subsystem.start();
+        return self;
+    }
+    fn deinitMetadata(self: *@This()) void {
+        for (self.owned_definition_names.items) |value| self.allocator.free(value);
+        for (self.owned_activity_names.items) |value| self.allocator.free(value);
+        for (self.owned_activity_ownership.items) |value| self.allocator.free(value);
+        for (self.owned_non_retryable.items) |value| self.allocator.free(value);
+        self.owned_definition_names.deinit(self.allocator);
+        self.owned_activity_names.deinit(self.allocator);
+        self.owned_activity_ownership.deinit(self.allocator);
+        self.owned_non_retryable.deinit(self.allocator);
+        self.activities.deinit();
+        self.definitions.deinit();
+        self.store.deinit();
+        self.allocator.free(self.namespace);
+        self.allocator.free(self.tenant);
+    }
+    fn deinit(self: *@This()) void {
+        self.subsystem.deinit();
+        self.deinitMetadata();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+} else struct {};
+
+const State = struct {
     allocator: std.mem.Allocator,
     clock_source: core.clock.SystemClock,
     compute: executor.FixedPool,
@@ -73,13 +177,17 @@ pub const Runtime = struct {
     events: []observability.event.Event,
     event_ring: observability.event.RingSink,
     detached: executor.DetachedTracker,
+    workflow: if (build_options.workflow_sqlite) ?*WorkflowOwned else void = if (build_options.workflow_sqlite) null else {},
     stopped: bool = false,
+};
 
-    /// Initializes each owned resource in dependency order and unwinds in reverse on failure.
+/// Address-stable aggregate owner for execution, I/O, observability, and optional SQLite Workflow workers.
+pub const Runtime = struct {
+    state: *State,
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !Runtime {
         if (config.fault == .clock) return error.InjectedFailure;
-        var clock_source = try core.clock.SystemClock.init();
-        _ = &clock_source;
+        const clock_source = try core.clock.SystemClock.init();
         if (config.fault == .compute) return error.InjectedFailure;
         var compute = try executor.FixedPool.init(allocator, config.compute_workers, config.queue_capacity);
         errdefer compute.deinit();
@@ -92,7 +200,9 @@ pub const Runtime = struct {
         if (config.fault == .observability) return error.InjectedFailure;
         const events = try allocator.alloc(observability.event.Event, config.observability_capacity);
         errdefer allocator.free(events);
-        return .{
+        const state = try allocator.create(State);
+        errdefer allocator.destroy(state);
+        state.* = .{
             .allocator = allocator,
             .clock_source = clock_source,
             .compute = compute,
@@ -103,48 +213,76 @@ pub const Runtime = struct {
             .event_ring = observability.event.RingSink.init(events),
             .detached = executor.DetachedTracker.init(allocator),
         };
+        if (build_options.workflow_sqlite) if (config.workflow) |workflow_config| {
+            if (config.fault == .workflow) return error.InjectedFailure;
+            state.workflow = try WorkflowOwned.init(allocator, workflow_config, state.clock_source.clock(), &state.compute, &state.blocking);
+        };
+        return .{ .state = state };
     }
 
     pub fn clock(self: *Runtime) core.clock.Clock {
-        return self.clock_source.clock();
+        return self.state.clock_source.clock();
     }
     pub fn computeExecutor(self: *Runtime) executor.Executor {
-        return self.compute.executor();
+        return self.state.compute.executor();
     }
     pub fn blockingExecutor(self: *Runtime) executor.Executor {
-        return self.blocking.executor();
+        return self.state.blocking.executor();
     }
     pub fn pumpExecutor(self: *Runtime) executor.Executor {
-        return self.pump.executor();
+        return self.state.pump.executor();
     }
     pub fn eventSink(self: *Runtime) observability.EventSink {
-        return self.event_ring.sink();
+        return self.state.event_ring.sink();
     }
     pub fn detachedTracker(self: *Runtime) *executor.DetachedTracker {
-        return &self.detached;
+        return &self.state.detached;
     }
 
-    /// Performs the runtime shutdown sequence and joins all owned execution resources before release.
     pub fn shutdown(self: *Runtime, deadline_monotonic_ns: ?u64) ShutdownReport {
-        if (self.stopped) return .{ .completed = true, .outstanding_detached = 0, .dropped_events = self.event_ring.droppedCount() };
-        if (deadline_monotonic_ns) |deadline| if (self.clock().monotonicNow() >= deadline) {
-            return .{ .completed = false, .outstanding_detached = self.detached.allocations.items.len, .dropped_events = self.event_ring.droppedCount() };
+        const state = self.state;
+        if (state.stopped) return self.shutdownReport(true, null);
+        if (deadline_monotonic_ns) |deadline_value| if (self.clock().monotonicNow() >= deadline_value) return self.shutdownReport(false, .workflow);
+        const deadline = if (deadline_monotonic_ns) |value| platform.park.deadlineAfter(value - self.clock().monotonicNow()) else null;
+        if (build_options.workflow_sqlite) if (state.workflow) |owned| {
+            owned.subsystem.requestStop();
+            owned.subsystem.wait(deadline) catch return self.shutdownReport(false, .workflow);
         };
-        self.pump.shutdown(.drain);
-        self.detached.shutdown();
-        self.blocking.shutdown(.cancel_pending);
-        self.compute.shutdown(.cancel_pending);
-        self.stopped = true;
-        return .{ .completed = true, .outstanding_detached = self.detached.allocations.items.len, .dropped_events = self.event_ring.droppedCount() };
+        state.pump.shutdown(.drain);
+        if (platform.park.expired(deadline)) return self.shutdownReport(false, .pump);
+        state.detached.requestStop();
+        state.blocking.requestStop(.cancel_pending);
+        state.compute.requestStop(.cancel_pending);
+        state.detached.wait(deadline) catch return self.shutdownReport(false, .detached);
+        state.blocking.wait(deadline) catch return self.shutdownReport(false, .blocking);
+        state.compute.wait(deadline) catch return self.shutdownReport(false, .compute);
+        state.stopped = true;
+        return self.shutdownReport(true, null);
+    }
+
+    fn shutdownReport(self: *Runtime, completed: bool, stage: ?ShutdownStage) ShutdownReport {
+        const state = self.state;
+        return .{
+            .completed = completed,
+            .timed_out_stage = stage,
+            .outstanding_workflow_workers = if (build_options.workflow_sqlite) if (state.workflow) |owned| owned.subsystem.outstanding() else 0 else 0,
+            .outstanding_executor_workers = state.blocking.outstandingWorkers() + state.compute.outstandingWorkers(),
+            .outstanding_detached = state.detached.outstanding(),
+            .dropped_events = state.event_ring.droppedCount(),
+        };
     }
 
     pub fn deinit(self: *Runtime) void {
+        const state = self.state;
         _ = self.shutdown(null);
-        self.detached.deinit();
-        self.pump.deinit();
-        self.blocking.deinit();
-        self.compute.deinit();
-        self.allocator.free(self.events);
+        if (build_options.workflow_sqlite) if (state.workflow) |owned| owned.deinit();
+        state.detached.deinit();
+        state.pump.deinit();
+        state.blocking.deinit();
+        state.compute.deinit();
+        state.allocator.free(state.events);
+        const allocator = state.allocator;
+        allocator.destroy(state);
         self.* = undefined;
     }
 };

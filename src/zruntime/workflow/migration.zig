@@ -1,6 +1,12 @@
 const std = @import("std");
 pub const StepFn = *const fn (allocator: std.mem.Allocator, state: []const u8) anyerror![]u8;
-pub const Step = struct { from_version: u32, to_version: u32, apply: StepFn };
+pub const Step = struct {
+    from_version: u32,
+    to_version: u32,
+    /// Stable identity of the migration implementation. Function addresses are never persisted.
+    identity_hash: u64,
+    apply: StepFn,
+};
 
 /// Applies explicit, contiguous state migrations. No definition version is selected implicitly.
 pub fn migrate(allocator: std.mem.Allocator, steps: []const Step, from: u32, to: u32, state: []const u8) anyerror![]u8 {

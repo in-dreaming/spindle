@@ -129,7 +129,7 @@ pub const LocalArtifactStore = struct {
 };
 
 /// Archives one eligible completed workflow after durable write and read-back verification.
-pub fn archiveCompleted(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: LocalArtifactStore, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, retention_before_utc_ms: i64) !Manifest {
+pub fn archiveCompleted(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: anytype, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, retention_before_utc_ms: i64) !Manifest {
     const hot = try store.readHistory(allocator, tenant, namespace, workflow_id);
     defer {
         for (hot) |record| allocator.free(record.payload);
@@ -141,19 +141,21 @@ pub fn archiveCompleted(allocator: std.mem.Allocator, store: *sqlite.Store, arti
     const bytes = try encode(allocator, records);
     defer allocator.free(bytes);
     const manifest = try verify(bytes);
-    var name_buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "{x}-{x}-{d}-{d}.spar", .{ workflow_id.high, workflow_id.low, manifest.first_sequence, manifest.last_sequence });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{x}", .{digest});
     try artifacts.put(name, bytes);
     const read_back = try artifacts.get(allocator, name);
     defer allocator.free(read_back);
     const verified = try verify(read_back);
-    if (verified.checksum != manifest.checksum) return error.ChecksumMismatch;
+    if (!manifestEqual(verified, manifest)) return error.ArchiveManifestMismatch;
     try store.commitArchive(.{ .workflow_id = workflow_id, .tenant = tenant, .namespace = namespace, .first_sequence = manifest.first_sequence, .last_sequence = manifest.last_sequence, .location = name, .checksum = manifest.checksum, .event_count = manifest.record_count, .retention_before_utc_ms = retention_before_utc_ms });
     return manifest;
 }
 
 /// Reads verified archives plus the hot tail and rejects gaps before replay.
-pub fn readHistory(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: LocalArtifactStore, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, max_events: usize) ![]Record {
+pub fn readHistory(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts: anytype, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, max_events: usize) ![]Record {
     const manifests = try store.archiveRecords(allocator, tenant, namespace, workflow_id);
     defer {
         for (manifests) |item| allocator.free(item.location);
@@ -168,6 +170,13 @@ pub fn readHistory(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts
     for (manifests) |item| {
         const bytes = try artifacts.get(allocator, item.location);
         defer allocator.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        var location_buf: [64]u8 = undefined;
+        const canonical_location = try std.fmt.bufPrint(&location_buf, "{x}", .{digest});
+        if (!std.mem.eql(u8, item.location, canonical_location)) return error.ArchiveLocationMismatch;
+        const verified = try verify(bytes);
+        if (verified.first_sequence != item.first_sequence or verified.last_sequence != item.last_sequence or verified.record_count != item.event_count or verified.checksum != item.checksum) return error.ArchiveManifestMismatch;
         const decoded = try decode(allocator, bytes);
         var transferred: usize = 0;
         defer {
@@ -196,4 +205,8 @@ pub fn readHistory(allocator: std.mem.Allocator, store: *sqlite.Store, artifacts
     }
     if (result.items.len > max_events) return error.ReplayLimitExceeded;
     return result.toOwnedSlice(allocator);
+}
+
+fn manifestEqual(a: Manifest, b: Manifest) bool {
+    return a.first_sequence == b.first_sequence and a.last_sequence == b.last_sequence and a.record_count == b.record_count and a.checksum == b.checksum;
 }

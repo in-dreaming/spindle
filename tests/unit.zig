@@ -135,7 +135,7 @@ test "workflow registry snapshots migrations and instance state transitions are 
             return value;
         }
     }.apply;
-    const migrated = try workflow.migration.migrate(std.testing.allocator, &.{.{ .from_version = 2, .to_version = 3, .apply = step }}, 2, 3, "state");
+    const migrated = try workflow.migration.migrate(std.testing.allocator, &.{.{ .from_version = 2, .to_version = 3, .identity_hash = 1, .apply = step }}, 2, 3, "state");
     defer std.testing.allocator.free(migrated);
     try std.testing.expectEqualStrings("state!", migrated);
     try std.testing.expectError(error.MigrationGap, workflow.migration.migrate(std.testing.allocator, &.{}, 2, 3, "state"));
@@ -480,6 +480,29 @@ test "tracked detached work is cancelled and joined by its explicit owner" {
     pump.shutdown(.cancel_pending);
     try handle.wait();
     try std.testing.expectEqual(spindle.executor.TaskState.cancelled, try handle.taskHandle().status());
+    handle.deinit();
+}
+
+test "detached handle may release before its tracker" {
+    var tracker = spindle.executor.DetachedTracker.init(std.testing.allocator);
+    var inline_executor: spindle.executor.InlineExecutor = .{};
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var handle = try spindle.executor.submitTrackedDetached(&tracker, std.testing.allocator, inline_executor.executor(), TaskProbe.run, &probe);
+    handle.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tracker.outstanding());
+    tracker.deinit();
+}
+
+test "detached tracker may release before a live handle and queued reference" {
+    var pump = try spindle.executor.PumpExecutor.init(std.testing.allocator, 2);
+    defer pump.deinit();
+    var tracker = spindle.executor.DetachedTracker.init(std.testing.allocator);
+    var value: std.atomic.Value(u32) = .init(0);
+    var probe = TaskProbe{ .value = &value };
+    var handle = try spindle.executor.submitTrackedDetached(&tracker, std.testing.allocator, pump.executor(), TaskProbe.run, &probe);
+    tracker.deinit();
+    pump.shutdown(.cancel_pending);
     handle.deinit();
 }
 

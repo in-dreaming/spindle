@@ -16,7 +16,7 @@ pub const max_payload_bytes: usize = 1024 * 1024;
 pub const Error = error{ WorkflowStoreInUse, MigrationMismatch, CorruptSchema, PayloadTooLarge, IdempotencyConflict, NotFound, StaleRuntimeEpoch, Conflict, DatabaseBusy, DatabaseFull, DatabaseIo, DatabaseReadOnly, DatabaseFailure, BackupInterrupted, MaintenanceCancelled, RestoreFailed, MigrationInProgress, MigrationFailed, Unauthorized, QuotaExceeded };
 pub const InstanceRecord = struct { id: core.StableId, definition_id: u64, definition_version: u32, status: instance.Status, state_version: u64, state: []u8 };
 pub const Claim = struct { task_id: core.StableId, workflow_id: core.StableId, state_version: u64, definition_id: u64, definition_version: u32, runtime_epoch: u64 };
-pub const ActivityClaim = struct { allocator: std.mem.Allocator, task_id: core.StableId, workflow_id: core.StableId, command_sequence: u64, attempt: u32, runtime_epoch: u64, scheduled_utc_ms: i64, started_utc_ms: i64, payload: []u8, schema: core.schema.SchemaKey };
+pub const ActivityClaim = struct { allocator: std.mem.Allocator, task_id: core.StableId, workflow_id: core.StableId, command_sequence: u64, attempt: u32, runtime_epoch: u64, scheduled_utc_ms: i64, started_utc_ms: i64, payload: []u8, schema: core.schema.SchemaKey, compensation_plan_id: ?core.StableId = null, compensation_step_index: ?u32 = null };
 pub const TimerClaim = struct { allocator: std.mem.Allocator, timer_id: core.StableId, workflow_id: core.StableId, runtime_epoch: u64, payload: []u8, schema: core.schema.SchemaKey };
 pub const OutboxClaim = struct { allocator: std.mem.Allocator, message_id: core.StableId, workflow_id: core.StableId, runtime_epoch: u64, payload: []u8 };
 pub const LoadedTask = struct {
@@ -72,6 +72,7 @@ const migration_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v1;
 const migration_v2_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v2;
 const migration_v3_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v3;
 const migration_v4_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v4;
+const migration_v5_sql = @import("workflow_sqlite_migrations").workflow_sqlite_v5;
 
 /// One SQLite connection, serialized by this store. It owns the process-local SQLite store lock.
 pub const Store = struct {
@@ -144,6 +145,7 @@ pub const Store = struct {
             return;
         }
         if (!value.authorized) {
+            try self.finishAudit(value, "terminate", false, "Unauthorized");
             try self.commit();
             return error.Unauthorized;
         }
@@ -158,13 +160,18 @@ pub const Store = struct {
         try self.bindId(update, 3, value.workflow_id);
         try self.bindInt(update, 4, self.clock.utcNow());
         _ = try self.step(update);
-        if (c.sqlite3_changes(self.db) != 1) return error.Conflict;
+        if (c.sqlite3_changes(self.db) != 1) {
+            try self.finishAudit(value, "terminate", false, "Conflict");
+            try self.commit();
+            return error.Conflict;
+        }
         const task = try self.prepare("UPDATE workflow_task SET status='completed',claimed_epoch=NULL WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3;");
         defer self.finalize(task);
         try self.bindText(task, 1, value.tenant);
         try self.bindText(task, 2, value.namespace);
         try self.bindId(task, 3, value.workflow_id);
         _ = try self.step(task);
+        try self.finishAudit(value, "terminate", true, null);
         try self.commit();
     }
 
@@ -182,11 +189,13 @@ pub const Store = struct {
             return;
         }
         if (!value.authorized) {
+            try self.finishAudit(value, "cancel", false, "Unauthorized");
             try self.commit();
             return error.Unauthorized;
         }
         try self.appendHistoryFact(value.tenant, value.namespace, value.workflow_id, event_id, event.Kind.cancellation_requested, .{ .id = 0, .version = 1 }, "", self.clock.utcNow());
         try self.wakeWorkflow(value.tenant, value.namespace, value.workflow_id, task_id, self.clock.utcNow());
+        try self.finishAudit(value, "cancel", true, null);
         try self.commit();
     }
 
@@ -204,6 +213,7 @@ pub const Store = struct {
             return;
         }
         if (!value.authorized) {
+            try self.finishAudit(value, "retry", false, "Unauthorized");
             try self.commit();
             return error.Unauthorized;
         }
@@ -214,6 +224,7 @@ pub const Store = struct {
         try self.bindId(clear, 3, value.workflow_id);
         _ = try self.step(clear);
         try self.wakeWorkflow(value.tenant, value.namespace, value.workflow_id, task_id, self.clock.utcNow());
+        try self.finishAudit(value, "retry", true, null);
         try self.commit();
     }
 
@@ -313,24 +324,45 @@ pub const Store = struct {
         return progress;
     }
 
-    /// Explicit offline restore. The source is validated, the old database is preserved as `.failed`, and reopening increments the epoch.
+    /// Staged offline restore. A rejected replacement is preserved and the previous live file is restored automatically.
     pub fn restoreOffline(allocator: std.mem.Allocator, path: []const u8, source: []const u8, clock: core.Clock) Error!Store {
         if (!validateFile(allocator, source)) return error.CorruptSchema;
         var failed: [1024:0]u8 = undefined;
         const failed_path = std.fmt.bufPrintZ(&failed, "{s}.failed", .{path}) catch return error.RestoreFailed;
+        var pending_buffer: [1024:0]u8 = undefined;
+        const pending_path = std.fmt.bufPrintZ(&pending_buffer, "{s}.restore.pending", .{path}) catch return error.RestoreFailed;
+        var rejected: [1024:0]u8 = undefined;
+        const rejected_path = std.fmt.bufPrintZ(&rejected, "{s}.rejected", .{path}) catch return error.RestoreFailed;
         const io = std.Options.debug_io;
+        std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), pending_path, io, .{ .replace = true }) catch return error.RestoreFailed;
+        errdefer std.Io.Dir.cwd().deleteFile(io, pending_path) catch {};
+        if (!validateFile(allocator, pending_path)) return error.CorruptSchema;
+        var had_live = true;
         std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), failed_path, io) catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound => had_live = false,
             else => return error.RestoreFailed,
         };
-        std.Io.Dir.cwd().rename(source, std.Io.Dir.cwd(), path, io) catch {
-            std.Io.Dir.cwd().rename(failed_path, std.Io.Dir.cwd(), path, io) catch {};
+        std.Io.Dir.cwd().rename(pending_path, std.Io.Dir.cwd(), path, io) catch {
+            if (had_live) std.Io.Dir.cwd().rename(failed_path, std.Io.Dir.cwd(), path, io) catch {};
             return error.RestoreFailed;
         };
-        var restored = try Store.init(allocator, path, clock);
-        errdefer restored.deinit();
-        const report = try restored.health();
-        if (report.integrity == .corrupt) return error.CorruptSchema;
+        var restored = Store.init(allocator, path, clock) catch {
+            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), rejected_path, io) catch {};
+            if (had_live) std.Io.Dir.cwd().rename(failed_path, std.Io.Dir.cwd(), path, io) catch {};
+            return error.RestoreFailed;
+        };
+        const report = restored.health() catch {
+            restored.deinit();
+            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), rejected_path, io) catch {};
+            if (had_live) std.Io.Dir.cwd().rename(failed_path, std.Io.Dir.cwd(), path, io) catch {};
+            return error.RestoreFailed;
+        };
+        if (report.integrity == .corrupt) {
+            restored.deinit();
+            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), rejected_path, io) catch {};
+            if (had_live) std.Io.Dir.cwd().rename(failed_path, std.Io.Dir.cwd(), path, io) catch {};
+            return error.CorruptSchema;
+        }
         return restored;
     }
 
@@ -590,6 +622,7 @@ pub const Store = struct {
             return;
         }
         if (!value.authorized) {
+            try self.finishAudit(mutation, "migrate", false, "Unauthorized");
             try self.commit();
             return error.Unauthorized;
         }
@@ -599,6 +632,7 @@ pub const Store = struct {
         try self.bindText(row, 2, value.namespace);
         try self.bindId(row, 3, value.workflow_id);
         if (!try self.step(row)) {
+            try self.finishAudit(mutation, "migrate", false, "Conflict");
             try self.commit();
             return error.Conflict;
         }
@@ -606,6 +640,7 @@ pub const Store = struct {
         const old_state = self.columnBlob(row, 1);
         const next_sequence: u64 = @intCast(self.columnInt(row, 2));
         const new_state = definition_migration.migrate(self.allocator, value.steps, from_version, value.target_version, old_state) catch {
+            try self.finishAudit(mutation, "migrate", false, "MigrationFailed");
             try self.commit();
             return error.MigrationFailed;
         };
@@ -643,6 +678,7 @@ pub const Store = struct {
         _ = try self.step(update);
         try self.insertSnapshot(value.tenant, value.namespace, .{ .workflow_id = value.workflow_id, .event_sequence = next_sequence, .definition_version = value.target_version, .state = new_state, .checksum = snapshot.checksum(value.workflow_id, next_sequence, value.target_version, new_state) });
         try self.wakeWorkflow(value.tenant, value.namespace, value.workflow_id, value.task_id, self.clock.utcNow());
+        try self.finishAudit(mutation, "migrate", true, null);
         try self.commit();
     }
 
@@ -653,7 +689,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         try self.begin();
         errdefer self.rollback();
-        const s = try self.prepare("UPDATE activity_task SET status_v2='claimed',claimed_epoch=?1,attempt=attempt+1,started_utc_ms=?4,heartbeat_utc_ms=?4 WHERE task_id=(SELECT task_id FROM activity_task WHERE tenant=?2 AND namespace=?3 AND ((status_v2='ready' AND available_utc_ms<=?4) OR (status_v2='claimed' AND claimed_epoch<>?1)) ORDER BY available_utc_ms,task_id LIMIT 1) RETURNING task_id,workflow_id,command_sequence,attempt,scheduled_utc_ms,started_utc_ms,payload,schema_id,schema_version;");
+        const s = try self.prepare("UPDATE activity_task SET status_v2='claimed',claimed_epoch=?1,attempt=attempt+1,started_utc_ms=?4,heartbeat_utc_ms=?4 WHERE task_id=(SELECT task_id FROM activity_task WHERE tenant=?2 AND namespace=?3 AND ((status_v2='ready' AND available_utc_ms<=?4) OR (status_v2='claimed' AND claimed_epoch<>?1)) ORDER BY available_utc_ms,task_id LIMIT 1) RETURNING task_id,workflow_id,command_sequence,attempt,scheduled_utc_ms,started_utc_ms,payload,schema_id,schema_version,compensation_plan_id,compensation_step_index;");
         defer self.finalize(s);
         try self.bindInt(s, 1, self.runtime_epoch);
         try self.bindText(s, 2, tenant);
@@ -663,7 +699,7 @@ pub const Store = struct {
             try self.commit();
             return null;
         }
-        const result = ActivityClaim{ .allocator = allocator, .task_id = self.columnId(s, 0), .workflow_id = self.columnId(s, 1), .command_sequence = @intCast(self.columnInt(s, 2)), .attempt = @intCast(self.columnInt(s, 3)), .runtime_epoch = self.runtime_epoch, .scheduled_utc_ms = self.columnInt(s, 4), .started_utc_ms = self.columnInt(s, 5), .payload = try allocator.dupe(u8, self.columnBlob(s, 6)), .schema = .{ .id = @bitCast(self.columnInt(s, 7)), .version = @intCast(self.columnInt(s, 8)) } };
+        const result = ActivityClaim{ .allocator = allocator, .task_id = self.columnId(s, 0), .workflow_id = self.columnId(s, 1), .command_sequence = @intCast(self.columnInt(s, 2)), .attempt = @intCast(self.columnInt(s, 3)), .runtime_epoch = self.runtime_epoch, .scheduled_utc_ms = self.columnInt(s, 4), .started_utc_ms = self.columnInt(s, 5), .payload = try allocator.dupe(u8, self.columnBlob(s, 6)), .schema = .{ .id = @bitCast(self.columnInt(s, 7)), .version = @intCast(self.columnInt(s, 8)) }, .compensation_plan_id = if (c.sqlite3_column_type(s, 9) == c.SQLITE_NULL) null else self.columnId(s, 9), .compensation_step_index = if (c.sqlite3_column_type(s, 10) == c.SQLITE_NULL) null else @intCast(self.columnInt(s, 10)) };
         _ = try self.step(s);
         try self.commit();
         return result;
@@ -672,6 +708,7 @@ pub const Store = struct {
     pub fn finishActivity(self: *Store, claim: ActivityClaim, tenant: []const u8, namespace: []const u8, kind: u32, schema: core.schema.SchemaKey, payload: []const u8) Error!void {
         if (!self.onDispatcher()) return self.invoke(Store.finishActivity, .{ claim, tenant, namespace, kind, schema, payload });
         defer claim.allocator.free(claim.payload);
+        if (claim.compensation_plan_id != null) return self.finishCompensation(claim, tenant, namespace, kind == event.Kind.activity_completed);
         try self.finishExternal("activity_task", "task_id", claim.task_id, claim.workflow_id, claim.runtime_epoch, tenant, namespace, kind, schema, payload);
     }
     pub fn heartbeatActivity(self: *Store, claim: ActivityClaim) Error!void {
@@ -1129,7 +1166,12 @@ pub const Store = struct {
         try self.bindId(plan, 3, workflow_id);
         try self.bindId(plan, 4, value.plan_id);
         _ = try self.step(plan);
-        const step_stmt = try self.prepare("INSERT OR IGNORE INTO compensation_step(tenant,namespace,plan_id,step_index,activity_type,schema_id,schema_version,input_hash,payload,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending');");
+        const plan_created = c.sqlite3_changes(self.db) == 1;
+        if (plan_created) {
+            const payload = value.plan_id.toBytes();
+            try self.appendHistoryFact(tenant, namespace, workflow_id, compensationEventId(value.plan_id, event.Kind.compensation_plan_started, 0), event.Kind.compensation_plan_started, @import("compensation.zig").schema, &payload, self.clock.utcNow());
+        }
+        const step_stmt = try self.prepare("INSERT OR IGNORE INTO compensation_step(tenant,namespace,plan_id,step_index,activity_type,schema_id,schema_version,input_hash,payload,status,task_id,command_sequence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending',?10,?11);");
         defer self.finalize(step_stmt);
         try self.bindText(step_stmt, 1, tenant);
         try self.bindText(step_stmt, 2, namespace);
@@ -1140,19 +1182,103 @@ pub const Store = struct {
         try self.bindInt(step_stmt, 7, value.schema.version);
         try self.bindInt(step_stmt, 8, @as(i64, @bitCast(value.input_hash)));
         try self.bindBlob(step_stmt, 9, value.payload);
+        try self.bindId(step_stmt, 10, value.task_id);
+        try self.bindInt(step_stmt, 11, value.command_sequence);
         _ = try self.step(step_stmt);
-        const task = try self.prepare("INSERT OR IGNORE INTO activity_task(task_id,tenant,namespace,workflow_id,command_sequence,payload,schema_id,schema_version,available_utc_ms,scheduled_utc_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9);");
+        try self.scheduleNextCompensation(tenant, namespace, workflow_id, value.plan_id);
+    }
+    fn scheduleNextCompensation(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, plan_id: core.StableId) Error!void {
+        const clear = try self.prepare("DELETE FROM activity_task WHERE tenant=?1 AND namespace=?2 AND compensation_plan_id=?3 AND status_v2='ready';");
+        defer self.finalize(clear);
+        try self.bindText(clear, 1, tenant);
+        try self.bindText(clear, 2, namespace);
+        try self.bindId(clear, 3, plan_id);
+        _ = try self.step(clear);
+        const reset = try self.prepare("UPDATE compensation_step SET status='pending' WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND status='running';");
+        defer self.finalize(reset);
+        try self.bindText(reset, 1, tenant);
+        try self.bindText(reset, 2, namespace);
+        try self.bindId(reset, 3, plan_id);
+        _ = try self.step(reset);
+        const reactivate = try self.prepare(
+            "UPDATE activity_task SET status_v2='ready',claimed_epoch=NULL,available_utc_ms=?4,scheduled_utc_ms=?4 " ++
+                "WHERE task_id=(SELECT task_id FROM compensation_step WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND status='pending' ORDER BY step_index DESC LIMIT 1) AND status_v2='completed';",
+        );
+        defer self.finalize(reactivate);
+        try self.bindText(reactivate, 1, tenant);
+        try self.bindText(reactivate, 2, namespace);
+        try self.bindId(reactivate, 3, plan_id);
+        try self.bindInt(reactivate, 4, self.clock.utcNow());
+        _ = try self.step(reactivate);
+        const task = try self.prepare(
+            "INSERT OR IGNORE INTO activity_task(task_id,tenant,namespace,workflow_id,command_sequence,payload,schema_id,schema_version,available_utc_ms,scheduled_utc_ms,compensation_plan_id,compensation_step_index) " ++
+                "SELECT task_id,tenant,namespace,?4,command_sequence,payload,schema_id,schema_version,?5,?5,plan_id,step_index FROM compensation_step WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND status='pending' ORDER BY step_index DESC LIMIT 1;",
+        );
         defer self.finalize(task);
-        try self.bindId(task, 1, value.task_id);
-        try self.bindText(task, 2, tenant);
-        try self.bindText(task, 3, namespace);
+        try self.bindText(task, 1, tenant);
+        try self.bindText(task, 2, namespace);
+        try self.bindId(task, 3, plan_id);
         try self.bindId(task, 4, workflow_id);
-        try self.bindInt(task, 5, value.command_sequence);
-        try self.bindBlob(task, 6, value.payload);
-        try self.bindInt(task, 7, @as(i64, @bitCast(value.schema.id)));
-        try self.bindInt(task, 8, value.schema.version);
-        try self.bindInt(task, 9, self.clock.utcNow());
+        try self.bindInt(task, 5, self.clock.utcNow());
         _ = try self.step(task);
+        const mark = try self.prepare("UPDATE compensation_step SET status='running' WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND step_index=(SELECT compensation_step_index FROM activity_task WHERE tenant=?1 AND namespace=?2 AND compensation_plan_id=?3 AND status_v2='ready');");
+        defer self.finalize(mark);
+        try self.bindText(mark, 1, tenant);
+        try self.bindText(mark, 2, namespace);
+        try self.bindId(mark, 3, plan_id);
+        _ = try self.step(mark);
+    }
+    fn finishCompensation(self: *Store, claim: ActivityClaim, tenant: []const u8, namespace: []const u8, succeeded: bool) Error!void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.begin();
+        errdefer self.rollback();
+        if (try self.metadataU64("runtime_epoch") != claim.runtime_epoch) return error.StaleRuntimeEpoch;
+        const plan_id = claim.compensation_plan_id.?;
+        const step_index = claim.compensation_step_index.?;
+        const task = try self.prepare("UPDATE activity_task SET status_v2='completed' WHERE task_id=?1 AND status_v2='claimed' AND claimed_epoch=?2;");
+        defer self.finalize(task);
+        try self.bindId(task, 1, claim.task_id);
+        try self.bindInt(task, 2, claim.runtime_epoch);
+        _ = try self.step(task);
+        if (c.sqlite3_changes(self.db) != 1) return error.StaleRuntimeEpoch;
+        const step_update = try self.prepare("UPDATE compensation_step SET status=?4 WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND step_index=?5 AND status='running';");
+        defer self.finalize(step_update);
+        try self.bindText(step_update, 1, tenant);
+        try self.bindText(step_update, 2, namespace);
+        try self.bindId(step_update, 3, plan_id);
+        try self.bindText(step_update, 4, if (succeeded) "completed" else "failed");
+        try self.bindInt(step_update, 5, step_index);
+        _ = try self.step(step_update);
+        if (c.sqlite3_changes(self.db) != 1) return error.Conflict;
+        var step_payload: [20]u8 = undefined;
+        const plan_bytes = plan_id.toBytes();
+        @memcpy(step_payload[0..16], &plan_bytes);
+        std.mem.writeInt(u32, step_payload[16..20], step_index, .big);
+        const step_kind = if (succeeded) event.Kind.compensation_step_completed else event.Kind.compensation_step_failed;
+        try self.appendHistoryFact(tenant, namespace, claim.workflow_id, compensationEventId(plan_id, step_kind, step_index), step_kind, @import("compensation.zig").schema, &step_payload, self.clock.utcNow());
+        if (succeeded) {
+            try self.scheduleNextCompensation(tenant, namespace, claim.workflow_id, plan_id);
+            const remaining = try self.prepare("SELECT 1 FROM compensation_step WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND status IN ('pending','running') LIMIT 1;");
+            defer self.finalize(remaining);
+            try self.bindText(remaining, 1, tenant);
+            try self.bindText(remaining, 2, namespace);
+            try self.bindId(remaining, 3, plan_id);
+            if (!try self.step(remaining)) try self.finishCompensationPlan(tenant, namespace, claim.workflow_id, plan_id, true);
+        } else try self.finishCompensationPlan(tenant, namespace, claim.workflow_id, plan_id, false);
+        try self.commit();
+    }
+    fn finishCompensationPlan(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, plan_id: core.StableId, succeeded: bool) Error!void {
+        const plan = try self.prepare("UPDATE compensation_plan SET status=?4 WHERE tenant=?1 AND namespace=?2 AND plan_id=?3 AND status='running';");
+        defer self.finalize(plan);
+        try self.bindText(plan, 1, tenant);
+        try self.bindText(plan, 2, namespace);
+        try self.bindId(plan, 3, plan_id);
+        try self.bindText(plan, 4, if (succeeded) "completed" else "failed");
+        _ = try self.step(plan);
+        const payload = plan_id.toBytes();
+        const kind = if (succeeded) event.Kind.compensation_plan_completed else event.Kind.compensation_plan_failed;
+        try self.appendHistoryFact(tenant, namespace, workflow_id, compensationEventId(plan_id, kind, 0), kind, @import("compensation.zig").schema, &payload, self.clock.utcNow());
     }
     fn notifyParent(self: *Store, tenant: []const u8, namespace: []const u8, child_id: core.StableId, status: instance.Status, utc_ms: i64) Error!void {
         const relation = try self.prepare("SELECT parent_workflow_id FROM workflow_child WHERE tenant=?1 AND namespace=?2 AND child_workflow_id=?3 AND notification_status='pending';");
@@ -1264,7 +1390,7 @@ pub const Store = struct {
         try self.commit();
     }
     fn appendHistoryFact(self: *Store, tenant: []const u8, namespace: []const u8, workflow_id: core.StableId, event_id: core.StableId, kind: u32, schema: core.schema.SchemaKey, payload: []const u8, utc_ms: i64) Error!void {
-        const seq = try self.prepare("SELECT next_sequence FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3 AND status='running';");
+        const seq = try self.prepare("SELECT next_sequence FROM workflow_instance WHERE tenant=?1 AND namespace=?2 AND workflow_id=?3;");
         defer self.finalize(seq);
         try self.bindText(seq, 1, tenant);
         try self.bindText(seq, 2, namespace);
@@ -1298,6 +1424,7 @@ pub const Store = struct {
         try self.applyOneMigration(2, migration_v2_sql);
         try self.applyOneMigration(3, migration_v3_sql);
         try self.applyOneMigration(4, migration_v4_sql);
+        try self.applyOneMigration(5, migration_v5_sql);
     }
     fn recoverClaims(self: *Store) Error!store_health.Recovery {
         var recovery = store_health.Recovery{};
@@ -1305,6 +1432,10 @@ pub const Store = struct {
         recovery.workflow_tasks = @intCast(c.sqlite3_changes(self.db));
         try self.exec("UPDATE activity_task SET status_v2='ready',claimed_epoch=NULL WHERE status_v2='claimed';");
         recovery.activities = @intCast(c.sqlite3_changes(self.db));
+        try self.exec("UPDATE compensation_step SET status='pending' WHERE status='running' AND EXISTS(SELECT 1 FROM compensation_plan p WHERE p.tenant=compensation_step.tenant AND p.namespace=compensation_step.namespace AND p.plan_id=compensation_step.plan_id AND p.status='running');");
+        try self.exec("UPDATE activity_task SET status_v2='completed',claimed_epoch=NULL WHERE compensation_plan_id IS NOT NULL AND status_v2='ready' AND compensation_step_index<>(SELECT max(s.step_index) FROM compensation_step s WHERE s.tenant=activity_task.tenant AND s.namespace=activity_task.namespace AND s.plan_id=activity_task.compensation_plan_id AND s.status='pending');");
+        try self.exec("UPDATE activity_task SET status_v2='ready',claimed_epoch=NULL WHERE compensation_plan_id IS NOT NULL AND status_v2='completed' AND compensation_step_index=(SELECT max(s.step_index) FROM compensation_step s WHERE s.tenant=activity_task.tenant AND s.namespace=activity_task.namespace AND s.plan_id=activity_task.compensation_plan_id AND s.status='pending');");
+        try self.exec("UPDATE compensation_step SET status='running' WHERE status='pending' AND EXISTS(SELECT 1 FROM activity_task a WHERE a.tenant=compensation_step.tenant AND a.namespace=compensation_step.namespace AND a.compensation_plan_id=compensation_step.plan_id AND a.compensation_step_index=compensation_step.step_index AND a.status_v2='ready');");
         try self.exec("UPDATE durable_timer SET status_v2='ready',claimed_epoch=NULL WHERE status_v2='claimed';");
         recovery.timers = @intCast(c.sqlite3_changes(self.db));
         try self.exec("UPDATE outbox SET status_v2='ready',claimed_epoch=NULL WHERE status_v2='claimed';");
@@ -1326,7 +1457,7 @@ pub const Store = struct {
         return @intCast(self.columnInt(statement, 0));
     }
     fn audit(self: *Store, value: OperatorMutation, action: []const u8) Error!bool {
-        const existing = try self.prepare("SELECT request_hash,authorized FROM workflow_operator_audit WHERE tenant=?1 AND namespace=?2 AND principal=?3 AND action=?4 AND idempotency_key=?5;");
+        const existing = try self.prepare("SELECT request_hash,authorized,result,error FROM workflow_operator_audit WHERE tenant=?1 AND namespace=?2 AND principal=?3 AND action=?4 AND idempotency_key=?5;");
         defer self.finalize(existing);
         try self.bindText(existing, 1, value.tenant);
         try self.bindText(existing, 2, value.namespace);
@@ -1336,6 +1467,14 @@ pub const Store = struct {
         if (try self.step(existing)) {
             if (@as(u64, @bitCast(self.columnInt(existing, 0))) != value.request_hash) return error.IdempotencyConflict;
             if ((self.columnInt(existing, 1) != 0) != value.authorized) return error.IdempotencyConflict;
+            const result = self.columnText(existing, 2);
+            if (std.mem.eql(u8, result, "failed")) {
+                const name = self.columnText(existing, 3);
+                if (std.mem.eql(u8, name, "Unauthorized")) return error.Unauthorized;
+                if (std.mem.eql(u8, name, "MigrationFailed")) return error.MigrationFailed;
+                return error.Conflict;
+            }
+            if (!std.mem.eql(u8, result, "succeeded")) return error.Conflict;
             return true;
         }
         const insert = try self.prepare("INSERT INTO workflow_operator_audit(tenant,namespace,workflow_id,principal,action,reason,idempotency_key,authorized,request_hash,created_utc_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
@@ -1352,6 +1491,19 @@ pub const Store = struct {
         try self.bindInt(insert, 10, self.clock.utcNow());
         _ = try self.step(insert);
         return false;
+    }
+    fn finishAudit(self: *Store, value: OperatorMutation, action: []const u8, succeeded: bool, error_name: ?[]const u8) Error!void {
+        const update = try self.prepare("UPDATE workflow_operator_audit SET result=?6,error=?7 WHERE tenant=?1 AND namespace=?2 AND principal=?3 AND action=?4 AND idempotency_key=?5;");
+        defer self.finalize(update);
+        try self.bindText(update, 1, value.tenant);
+        try self.bindText(update, 2, value.namespace);
+        try self.bindText(update, 3, value.principal);
+        try self.bindText(update, 4, action);
+        try self.bindText(update, 5, value.idempotency_key);
+        try self.bindText(update, 6, if (succeeded) "succeeded" else "failed");
+        if (error_name) |name| try self.bindText(update, 7, name) else if (c.sqlite3_bind_null(update, 7) != c.SQLITE_OK) return error.DatabaseFailure;
+        _ = try self.step(update);
+        if (c.sqlite3_changes(self.db) != 1) return error.DatabaseFailure;
     }
     fn validateOperatorMutation(_: *Store, value: OperatorMutation) Error!void {
         if (value.principal.len == 0 or value.reason.len == 0 or value.idempotency_key.len == 0) return error.Unauthorized;
@@ -1386,7 +1538,8 @@ pub const Store = struct {
         const second = self.migrationMatches(2, migration_v2_sql) catch return false;
         const third = self.migrationMatches(3, migration_v3_sql) catch return false;
         const fourth = self.migrationMatches(4, migration_v4_sql) catch return false;
-        return first and second and third and fourth;
+        const fifth = self.migrationMatches(5, migration_v5_sql) catch return false;
+        return first and second and third and fourth and fifth;
     }
     fn migrationMatches(self: *Store, version: i64, sql: []const u8) Error!bool {
         const statement = try self.prepare("SELECT checksum FROM spindle_schema_migration WHERE version=?1;");
@@ -1540,6 +1693,12 @@ fn derivedEventId(base: core.StableId, sequence: i64) core.StableId {
     std.mem.writeInt(u64, bytes[8..16], low, .big);
     return .fromBytes(bytes);
 }
+fn compensationEventId(plan_id: core.StableId, kind: u32, step_index: u32) core.StableId {
+    return .{
+        .high = plan_id.high ^ 0x636f_6d70_2e65_766e,
+        .low = plan_id.low ^ (@as(u64, kind) << 32) ^ step_index,
+    };
+}
 fn map(code: c_int) Error {
     return switch (code & 0xff) {
         c.SQLITE_BUSY, c.SQLITE_LOCKED => error.DatabaseBusy,
@@ -1559,7 +1718,7 @@ fn quickCheckDb(db: *c.sqlite3) bool {
 }
 fn validateDb(db: *c.sqlite3) bool {
     if (!quickCheckDb(db)) return false;
-    if (!migrationDbMatches(db, 1, migration_sql) or !migrationDbMatches(db, 2, migration_v2_sql) or !migrationDbMatches(db, 3, migration_v3_sql) or !migrationDbMatches(db, 4, migration_v4_sql)) return false;
+    if (!migrationDbMatches(db, 1, migration_sql) or !migrationDbMatches(db, 2, migration_v2_sql) or !migrationDbMatches(db, 3, migration_v3_sql) or !migrationDbMatches(db, 4, migration_v4_sql) or !migrationDbMatches(db, 5, migration_v5_sql)) return false;
     const invariant_failures = rawScalar(
         db,
         "SELECT " ++

@@ -101,17 +101,33 @@ pub const WorkflowSubsystem = struct {
     }
     /// Requests cooperative cancellation, then waits for and joins all four loops by deadline.
     pub fn shutdown(self: *WorkflowSubsystem, deadline: ?platform.park.Deadline) !void {
+        self.requestStop();
+        try self.wait(deadline);
+    }
+    pub fn requestStop(self: *WorkflowSubsystem) void {
         self.stopping.store(true, .release);
         self.activity_cancel.cancel();
         _ = self.idle_word.fetchAdd(1, .release);
         platform.park.wakeAll(&self.idle_word.raw);
-        if (self.threads[0] == null) return;
+    }
+    pub fn wait(self: *WorkflowSubsystem, deadline: ?platform.park.Deadline) !void {
+        if (self.threads[0] == null) {
+            if (self.failed.load(.acquire)) return error.WorkerFailed;
+            return;
+        }
         for (&self.done) |*value| value.wait(deadline, .{}) catch |err| switch (err) {
             error.Timeout => return error.Timeout,
             else => return err,
         };
         self.joinStarted();
         if (self.failed.load(.acquire)) return error.WorkerFailed;
+    }
+    pub fn outstanding(self: *const WorkflowSubsystem) usize {
+        var count: usize = 0;
+        for (self.threads) |thread| if (thread != null) {
+            count += 1;
+        };
+        return count;
     }
     fn joinStarted(self: *WorkflowSubsystem) void {
         for (&self.threads) |*thread| if (thread.*) |value| {

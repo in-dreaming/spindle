@@ -3,70 +3,167 @@ const Task = @import("task.zig").Task;
 const TaskHandle = @import("task.zig").TaskHandle;
 const Executor = @import("executor.zig").Executor;
 const AdaptiveMutex = @import("../sync/adaptive_mutex.zig").AdaptiveMutex;
+const park = @import("../platform/park.zig");
 
-pub const Allocation = struct { allocator: std.mem.Allocator, task: Task };
-
-/// Explicit owner for detached work. Runtime shutdown calls `shutdown` to cancel queued work and join it.
-pub const DetachedTracker = struct {
+const TrackerState = struct {
     allocator: std.mem.Allocator,
     lock: AdaptiveMutex = .{},
     allocations: std.ArrayListUnmanaged(*Allocation) = .empty,
+    accepting: bool = true,
+    refs: std.atomic.Value(usize) = .init(1),
+
+    fn retain(self: *TrackerState) void {
+        _ = self.refs.fetchAdd(1, .acq_rel);
+    }
+    fn release(self: *TrackerState) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            self.allocations.deinit(self.allocator);
+            self.allocator.destroy(self);
+        }
+    }
+};
+
+pub const Allocation = struct {
+    allocator: std.mem.Allocator,
+    task: Task,
+    refs: std.atomic.Value(usize) = .init(1),
+    link_lock: AdaptiveMutex = .{},
+    tracker: ?*TrackerState = null,
+
+    fn retain(self: *Allocation) void {
+        _ = self.refs.fetchAdd(1, .acq_rel);
+    }
+    fn release(self: *Allocation) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.allocator.destroy(self);
+    }
+};
+
+/// Explicit owner for detached work. Its heap state remains stable when this value moves.
+pub const DetachedTracker = struct {
+    allocator: std.mem.Allocator,
+    init_lock: AdaptiveMutex = .{},
+    state: ?*TrackerState = null,
+
     pub fn init(allocator: std.mem.Allocator) DetachedTracker {
         return .{ .allocator = allocator };
     }
-    pub fn deinit(self: *DetachedTracker) void {
-        self.shutdown();
-        self.allocations.deinit(self.allocator);
-        self.* = undefined;
+    fn ensureState(self: *DetachedTracker) !*TrackerState {
+        self.init_lock.lock();
+        defer self.init_lock.unlock();
+        if (self.state) |state| return state;
+        const state = try self.allocator.create(TrackerState);
+        state.* = .{ .allocator = self.allocator };
+        self.state = state;
+        return state;
+    }
+    pub fn requestStop(self: *DetachedTracker) void {
+        const state = self.state orelse return;
+        state.lock.lock();
+        state.accepting = false;
+        for (state.allocations.items) |allocation| _ = allocation.task.cancel();
+        state.lock.unlock();
+    }
+    pub fn wait(self: *DetachedTracker, deadline: ?park.Deadline) error{Timeout}!void {
+        const state = self.state orelse return;
+        state.lock.lock();
+        const snapshot = self.allocator.alloc(*Allocation, state.allocations.items.len) catch {
+            state.lock.unlock();
+            return error.Timeout;
+        };
+        for (state.allocations.items, 0..) |allocation, index| {
+            allocation.retain();
+            snapshot[index] = allocation;
+        }
+        state.lock.unlock();
+        defer {
+            for (snapshot) |allocation| allocation.release();
+            self.allocator.free(snapshot);
+        }
+        for (snapshot) |allocation| {
+            allocation.task.done.wait(deadline, .{}) catch return error.Timeout;
+        }
     }
     pub fn shutdown(self: *DetachedTracker) void {
-        self.lock.lock();
-        const items = self.allocations.items;
-        for (items) |allocation| _ = allocation.task.cancel();
-        self.lock.unlock();
-        for (items) |allocation| allocation.task.wait() catch {};
+        self.requestStop();
+        self.wait(null) catch unreachable;
     }
-    fn add(self: *DetachedTracker, allocation: *Allocation) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        try self.allocations.append(self.allocator, allocation);
+    pub fn outstanding(self: *DetachedTracker) usize {
+        const state = self.state orelse return 0;
+        state.lock.lock();
+        defer state.lock.unlock();
+        return state.allocations.items.len;
     }
-    fn remove(self: *DetachedTracker, allocation: *Allocation) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        for (self.allocations.items, 0..) |item, index| if (item == allocation) {
-            _ = self.allocations.swapRemove(index);
+    pub fn deinit(self: *DetachedTracker) void {
+        const state = self.state orelse {
+            self.* = undefined;
             return;
         };
+        self.shutdown();
+        while (true) {
+            state.lock.lock();
+            const allocation = if (state.allocations.items.len == 0) null else state.allocations.pop();
+            state.lock.unlock();
+            const value = allocation orelse break;
+            value.link_lock.lock();
+            if (value.tracker == state) value.tracker = null;
+            value.link_lock.unlock();
+            value.release();
+        }
+        self.state = null;
+        state.release();
+        self.* = undefined;
+    }
+    fn add(self: *DetachedTracker, allocation: *Allocation) !void {
+        const state = try self.ensureState();
+        state.lock.lock();
+        defer state.lock.unlock();
+        if (!state.accepting) return error.Shutdown;
+        try state.allocations.append(state.allocator, allocation);
+        allocation.retain();
+        allocation.link_lock.lock();
+        allocation.tracker = state;
+        allocation.link_lock.unlock();
     }
 };
 
-/// Owning handle for explicitly detached work. Deinit waits and releases the heap-owned task.
 pub const DetachedHandle = struct {
-    allocation: *Allocation,
-    tracker: ?*DetachedTracker = null,
+    allocation: ?*Allocation,
     pub fn wait(self: DetachedHandle) !void {
-        try self.allocation.task.wait();
+        try self.allocation.?.task.wait();
     }
     pub fn cancel(self: DetachedHandle) bool {
-        return self.allocation.task.cancel();
+        return self.allocation.?.task.cancel();
     }
     pub fn taskHandle(self: DetachedHandle) TaskHandle {
-        return self.allocation.task.handle();
+        return self.allocation.?.task.handle();
     }
     pub fn deinit(self: *DetachedHandle) void {
-        self.wait() catch {};
-        self.allocation.task.waitQueueReleased() catch {};
-        if (self.tracker) |tracker| tracker.remove(self.allocation);
-        self.allocation.allocator.destroy(self.allocation);
+        const allocation = self.allocation orelse return;
+        allocation.task.wait() catch {};
+        allocation.task.waitQueueReleased() catch {};
+        allocation.link_lock.lock();
+        const state = allocation.tracker;
+        if (state) |value| value.retain();
+        allocation.tracker = null;
+        allocation.link_lock.unlock();
+        if (state) |value| {
+            value.lock.lock();
+            for (value.allocations.items, 0..) |item, index| if (item == allocation) {
+                _ = value.allocations.swapRemove(index);
+                allocation.release();
+                break;
+            };
+            value.lock.unlock();
+            value.release();
+        }
+        allocation.release();
+        self.allocation = null;
     }
 };
 
-/// Submits heap-owned detached work. Prefer `submitTrackedDetached` for runtime-managed work.
 pub fn submitDetached(allocator: std.mem.Allocator, executor: Executor, run_fn: *const fn (*Task) void, context: ?*anyopaque) !DetachedHandle {
     return submitTrackedDetached(null, allocator, executor, run_fn, context);
 }
-/// Registers detached work with an explicit shutdown owner before returning its handle.
 pub fn submitTrackedDetached(tracker: ?*DetachedTracker, allocator: std.mem.Allocator, executor: Executor, run_fn: *const fn (*Task) void, context: ?*anyopaque) !DetachedHandle {
     const allocation = try allocator.create(Allocation);
     allocation.* = .{ .allocator = allocator, .task = Task.init(run_fn, context) };
@@ -78,8 +175,9 @@ pub fn submitTrackedDetached(tracker: ?*DetachedTracker, allocator: std.mem.Allo
     if (tracker) |owner| owner.add(allocation) catch |err| {
         _ = allocation.task.cancel();
         allocation.task.wait() catch {};
+        allocation.task.waitQueueReleased() catch {};
         allocator.destroy(allocation);
         return err;
     };
-    return .{ .allocation = allocation, .tracker = tracker };
+    return .{ .allocation = allocation };
 }

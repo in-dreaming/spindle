@@ -6,3 +6,5 @@ pub const workflow_sqlite_v2 = @embedFile("0002_activity_timer_messaging.sql");
 pub const workflow_sqlite_v3 = @embedFile("0003_child_compensation.sql");
 /// Operator audit, migration fencing, and archive discovery metadata.
 pub const workflow_sqlite_v4 = @embedFile("0004_workflow_operator_archive.sql");
+/// Compensation activity linkage and durable operator outcomes.
+pub const workflow_sqlite_v5 = @embedFile("0005_compensation_audit.sql");

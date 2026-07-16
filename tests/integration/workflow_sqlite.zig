@@ -16,6 +16,10 @@ fn cleanup(path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(io, shm) catch {};
     const failed = std.fmt.bufPrint(&buffer, "{s}.failed", .{path}) catch return;
     std.Io.Dir.cwd().deleteFile(io, failed) catch {};
+    const rejected = std.fmt.bufPrint(&buffer, "{s}.rejected", .{path}) catch return;
+    std.Io.Dir.cwd().deleteFile(io, rejected) catch {};
+    const pending_restore = std.fmt.bufPrint(&buffer, "{s}.restore.pending", .{path}) catch return;
+    std.Io.Dir.cwd().deleteFile(io, pending_restore) catch {};
 }
 
 fn execRaw(path: []const u8, sql: [*:0]const u8) !void {
@@ -729,7 +733,7 @@ test "store health reports deterministic claim recovery and clean shutdown state
     defer reopened.deinit();
     const report = try reopened.health();
     try std.testing.expect(report.previous_shutdown_clean);
-    try std.testing.expectEqual(@as(u32, 4), report.schema_version);
+    try std.testing.expectEqual(@as(u32, 5), report.schema_version);
     try std.testing.expect(report.migration_hashes_valid);
     try std.testing.expectEqual(@as(u64, 1), report.recovery.workflow_tasks);
     try std.testing.expectEqual(spindle.workflow.store_health.Integrity.repairable_queue_state, report.integrity);
@@ -753,6 +757,8 @@ test "online backup validates and offline restore preserves replaced database" {
     store.deinit();
     var restored = try spindle.workflow.sqlite.Store.restoreOffline(std.testing.allocator, file, backup, clock_source.clock());
     defer restored.deinit();
+    _ = try std.Io.Dir.cwd().statFile(std.Options.debug_io, backup, .{});
+    _ = try std.Io.Dir.cwd().statFile(std.Options.debug_io, file ++ ".failed", .{});
     const value = try restored.getInstance("backup", "test", workflow_id);
     defer std.testing.allocator.free(value.state);
     try std.testing.expectEqualStrings("", value.state);
@@ -788,6 +794,97 @@ fn migrationSuffix(allocator: std.mem.Allocator, state: []const u8) ![]u8 {
     return result;
 }
 
+test "aggregate runtime owns and joins sqlite workflow infrastructure" {
+    const file = ".zig-cache/workflow-runtime-owned.db";
+    cleanup(file);
+    defer cleanup(file);
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .{ .block = .global } });
+    defer threaded.deinit();
+    var runtime = try spindle.runtime.Runtime.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .workflow = .{
+            .database_path = file,
+            .tenant = "runtime",
+            .namespace = "owned",
+            .definitions = &.{login.definition},
+            .activities = &.{},
+            .transport = .{ .context = null, .publish_fn = discardTransport },
+        },
+    });
+    defer runtime.deinit();
+    const report = runtime.shutdown(runtime.clock().monotonicNow() + std.time.ns_per_s);
+    try std.testing.expect(report.completed);
+    try std.testing.expectEqual(@as(usize, 0), report.outstanding_workflow_workers);
+}
+
+const CompensationProbe = struct {
+    var count: usize = 0;
+    var order: [2]u8 = undefined;
+    fn reset() void {
+        count = 0;
+    }
+    fn run(_: spindle.workflow.activity.Context, payload: spindle.workflow.event.Payload) !spindle.workflow.activity.Result {
+        order[count] = if (std.mem.eql(u8, payload.bytes, "undo-1")) 1 else 0;
+        count += 1;
+        return .{ .completed = .{ .schema = login.event_schema, .bytes = "ok" } };
+    }
+};
+
+test "compensation plan schedules one step at a time in strict reverse order" {
+    const file = ".zig-cache/workflow-compensation-chain.db";
+    cleanup(file);
+    defer cleanup(file);
+    CompensationProbe.reset();
+    var clock_source = spindle.core.clock.VirtualClock.init(0, 2200);
+    var ids: Ids = .{};
+    var store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    defer store.deinit();
+    const client = spindle.workflow.client.Client{ .store = &store, .auth_context = null, .auth = spindle.workflow.client.allowAll, .ids = .{ .context = &ids, .next_fn = Ids.next } };
+    const workflow_id = try client.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "compensate" }, .tenant = "comp", .namespace = "chain", .idempotency_key = "start", .utc_ms = 2200 });
+    const claim = (try store.claimWorkflowTask("comp", "chain")).?;
+    const plan_id = Ids.next(&ids);
+    try store.commitWorkflowTaskTransition(.{
+        .claim = claim,
+        .tenant = "comp",
+        .namespace = "chain",
+        .state = "failed",
+        .status = .failed,
+        .last_processed_sequence = 1,
+        .scheduled = .{ .compensations = &.{
+            .{ .plan_id = plan_id, .task_id = Ids.next(&ids), .command_sequence = 10, .activity_type = 100, .schema = login.command_schema, .payload = "undo-0", .input_hash = spindle.core.hash.content("undo-0"), .index = 0 },
+            .{ .plan_id = plan_id, .task_id = Ids.next(&ids), .command_sequence = 11, .activity_type = 101, .schema = login.command_schema, .payload = "undo-1", .input_hash = spindle.core.hash.content("undo-1"), .index = 1 },
+        } },
+        .updated_utc_ms = 2200,
+    });
+    const abandoned = (try store.claimActivity(std.testing.allocator, "comp", "chain")).?;
+    std.testing.allocator.free(abandoned.payload);
+    store.deinit();
+    store = try spindle.workflow.sqlite.Store.init(std.testing.allocator, file, clock_source.clock());
+    var registry = spindle.workflow.activity.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.register(.{ .stable_name = "undo-0", .type_id = 100, .input_schema = login.command_schema, .output_schema = login.event_schema, .ownership = "test", .idempotency = .required, .executor = .compute, .handler = CompensationProbe.run });
+    try registry.register(.{ .stable_name = "undo-1", .type_id = 101, .input_schema = login.command_schema, .output_schema = login.event_schema, .ownership = "test", .idempotency = .required, .executor = .compute, .handler = CompensationProbe.run });
+    registry.freeze();
+    var compute = try spindle.executor.FixedPool.init(std.testing.allocator, 1, 4);
+    defer compute.deinit();
+    var blocking = try spindle.executor.BlockingExecutor.init(std.testing.allocator, 1, 4);
+    defer blocking.deinit();
+    const activity_worker = spindle.workflow.activity_worker.Worker{ .allocator = std.testing.allocator, .store = &store, .registry = &registry, .tenant = "comp", .namespace = "chain", .compute = compute.executor(), .blocking = blocking.executor() };
+    try std.testing.expect(try activity_worker.runOne());
+    try std.testing.expect(try activity_worker.runOne());
+    try std.testing.expect(!(try activity_worker.runOne()));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, CompensationProbe.order[0..CompensationProbe.count]);
+    const history = try store.readHistory(std.testing.allocator, "comp", "chain", workflow_id);
+    defer {
+        for (history) |record| std.testing.allocator.free(record.payload);
+        std.testing.allocator.free(history);
+    }
+    try std.testing.expectEqual(spindle.workflow.event.Kind.compensation_plan_started, history[1].kind);
+    try std.testing.expectEqual(spindle.workflow.event.Kind.compensation_step_completed, history[2].kind);
+    try std.testing.expectEqual(spindle.workflow.event.Kind.compensation_step_completed, history[3].kind);
+    try std.testing.expectEqual(spindle.workflow.event.Kind.compensation_plan_completed, history[4].kind);
+}
+
 test "definition migration and audited termination are atomic and idempotent" {
     const file = ".zig-cache/workflow-task21.db";
     cleanup(file);
@@ -804,13 +901,15 @@ test "definition migration and audited termination are atomic and idempotent" {
     try std.testing.expectError(error.QuotaExceeded, quota_denied.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "quota" }, .tenant = "operator", .namespace = "test", .idempotency_key = "quota", .utc_ms = 2100 }));
     const stale_claim = (try store.claimWorkflowTask("operator", "test")).?;
     const admin = spindle.workflow.operator.Client{ .store = &store, .principal = .{ .name = "admin", .tenant = "operator", .namespace = "test", .role = .admin }, .ids = .{ .context = &ids, .next_fn = Ids.next } };
-    try admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "upgrade", .idempotency_key = "migrate" }, .target_version = 4, .target_hash = 0x55, .steps = &.{.{ .from_version = 3, .to_version = 4, .apply = migrationSuffix }} });
+    try admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "upgrade", .idempotency_key = "migrate" }, .target_version = 4, .target_hash = 0x55, .steps = &.{.{ .from_version = 3, .to_version = 4, .identity_hash = 0x6d69677261746534, .apply = migrationSuffix }} });
     const migrated = try store.getInstance("operator", "test", workflow_id);
     defer std.testing.allocator.free(migrated.state);
     try std.testing.expectEqual(@as(u32, 4), migrated.definition_version);
     try std.testing.expectEqualStrings("!", migrated.state);
     try std.testing.expectError(error.Conflict, store.commitWorkflowTaskTransition(.{ .claim = stale_claim, .tenant = "operator", .namespace = "test", .state = "stale", .status = .running, .last_processed_sequence = 1, .updated_utc_ms = 2100 }));
     try std.testing.expectError(error.MigrationFailed, admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "broken", .idempotency_key = "broken" }, .target_version = 5, .target_hash = 0x66, .steps = &.{} }));
+    try std.testing.expectError(error.MigrationFailed, admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "broken", .idempotency_key = "broken" }, .target_version = 5, .target_hash = 0x66, .steps = &.{} }));
+    try std.testing.expectError(error.IdempotencyConflict, admin.migrate(.{ .mutation = .{ .workflow_id = workflow_id, .tenant = "operator", .namespace = "test", .reason = "broken", .idempotency_key = "broken" }, .target_version = 5, .target_hash = 0x67, .steps = &.{} }));
     const after_failure = try store.getInstance("operator", "test", workflow_id);
     defer std.testing.allocator.free(after_failure.state);
     try std.testing.expectEqual(@as(u32, 4), after_failure.definition_version);

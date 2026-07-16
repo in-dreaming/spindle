@@ -3,6 +3,8 @@ const Task = @import("task.zig").Task;
 const api = @import("executor.zig");
 const MpmcQueue = @import("../concurrent/mpmc_queue.zig").MpmcQueue;
 const Thread = @import("../platform/thread.zig");
+const Event = @import("../sync/event.zig").Event;
+const park = @import("../platform/park.zig");
 threadlocal var worker_state: ?*anyopaque = null;
 
 /// Fixed-size compute pool. Tasks run on dedicated worker threads; completion order is unspecified.
@@ -14,6 +16,9 @@ pub const FixedPool = struct {
         threads: []Thread.Thread,
         accepting: std.atomic.Value(bool) = .init(true),
         stopping: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(usize) = .init(0),
+        done: Event = Event.init(.manual, false),
+        joined: std.atomic.Value(bool) = .init(false),
     };
 
     pub fn init(allocator: std.mem.Allocator, workers: usize, queue_capacity: usize) !FixedPool {
@@ -70,12 +75,23 @@ pub const FixedPool = struct {
             break;
         }
     }
-    pub fn shutdown(self: *FixedPool, policy: api.ShutdownPolicy) void {
+    pub fn requestStop(self: *FixedPool, policy: api.ShutdownPolicy) void {
         if (self.state.stopping.swap(true, .acq_rel)) return;
         self.state.accepting.store(false, .release);
         if (policy != .drain) self.cancelPending();
         self.state.queue.close();
-        for (self.state.threads) |thread| thread.join();
+    }
+    pub fn wait(self: *FixedPool, deadline: ?park.Deadline) error{Timeout}!void {
+        if (!self.state.stopping.load(.acquire)) return;
+        self.state.done.wait(deadline, .{}) catch return error.Timeout;
+        if (!self.state.joined.swap(true, .acq_rel)) for (self.state.threads) |thread| thread.join();
+    }
+    pub fn outstandingWorkers(self: *const FixedPool) usize {
+        return self.state.threads.len - self.state.finished.load(.acquire);
+    }
+    pub fn shutdown(self: *FixedPool, policy: api.ShutdownPolicy) void {
+        self.requestStop(policy);
+        self.wait(null) catch unreachable;
     }
     fn cancelPending(self: *FixedPool) void {
         while (true) {
@@ -99,7 +115,10 @@ pub const FixedPool = struct {
     }
     fn workerMain(state: *State) void {
         worker_state = @ptrCast(state);
-        defer worker_state = null;
+        defer {
+            worker_state = null;
+            if (state.finished.fetchAdd(1, .acq_rel) + 1 == state.threads.len) state.done.set();
+        }
         while (true) {
             const task = state.queue.tryPop() catch |err| switch (err) {
                 error.Empty => {

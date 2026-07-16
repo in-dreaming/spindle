@@ -9,7 +9,7 @@ pub const HistoryAppend = struct { event_id: core.StableId, value: event.Event }
 pub const WorkflowTask = struct { task_id: core.StableId };
 /// At-least-once activity delivery derived from a deterministic command.
 pub const ActivityTask = struct { task_id: core.StableId, command_sequence: u64, schema: core.schema.SchemaKey, payload: []const u8 };
-/// Durable timer. PostgreSQL server time is authoritative when it is later claimed.
+/// Durable timer. Store-provided UTC time is authoritative when it is later claimed.
 pub const Timer = struct { timer_id: core.StableId, fire_at_utc_ms: i64, schema: core.schema.SchemaKey, payload: []const u8 };
 /// An outbox message which remains publishable until a publisher marks it sent.
 pub const OutboxMessage = struct { message_id: core.StableId, payload: []const u8 };

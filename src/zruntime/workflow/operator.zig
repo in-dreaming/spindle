@@ -50,7 +50,7 @@ pub const Client = struct {
     }
     pub fn migrate(self: Client, value: Migration) Error!void {
         const authorized = self.principal.role == .admin and self.inScope(value.mutation.tenant, value.mutation.namespace);
-        return self.store.migrateDefinition(.{ .workflow_id = value.mutation.workflow_id, .tenant = value.mutation.tenant, .namespace = value.mutation.namespace, .target_version = value.target_version, .target_hash = value.target_hash, .principal = self.principal.name, .reason = value.mutation.reason, .idempotency_key = value.mutation.idempotency_key, .authorized = authorized, .request_hash = requestHash(value.mutation, "migrate"), .event_id = self.ids.next(), .task_id = self.ids.next(), .steps = value.steps });
+        return self.store.migrateDefinition(.{ .workflow_id = value.mutation.workflow_id, .tenant = value.mutation.tenant, .namespace = value.mutation.namespace, .target_version = value.target_version, .target_hash = value.target_hash, .principal = self.principal.name, .reason = value.mutation.reason, .idempotency_key = value.mutation.idempotency_key, .authorized = authorized, .request_hash = migrationRequestHash(value), .event_id = self.ids.next(), .task_id = self.ids.next(), .steps = value.steps });
     }
     fn canOperate(self: Client) bool {
         return self.principal.role != .viewer;
@@ -71,5 +71,25 @@ fn requestHash(value: Mutation, action: []const u8) u64 {
     hasher.update(value.namespace);
     hasher.update(value.reason);
     hasher.update(action);
+    return hasher.final();
+}
+
+fn migrationRequestHash(value: Migration) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    var base: [8]u8 = undefined;
+    std.mem.writeInt(u64, &base, requestHash(value.mutation, "migrate"), .big);
+    hasher.update(&base);
+    var target: [12]u8 = undefined;
+    std.mem.writeInt(u32, target[0..4], value.target_version, .big);
+    std.mem.writeInt(u64, target[4..12], value.target_hash, .big);
+    hasher.update(&target);
+    for (value.steps, 0..) |step, index| {
+        var bytes: [24]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], @intCast(index), .big);
+        std.mem.writeInt(u32, bytes[8..12], step.from_version, .big);
+        std.mem.writeInt(u32, bytes[12..16], step.to_version, .big);
+        std.mem.writeInt(u64, bytes[16..24], step.identity_hash, .big);
+        hasher.update(&bytes);
+    }
     return hasher.final();
 }

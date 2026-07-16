@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const stress_iterations = b.option(u32, "stress-iterations", "Iterations used by bounded stress tests") orelse 128;
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
     const task_graph_enabled = b.option(bool, "task-graph", "Build the local task graph") orelse true;
     const ecs_enabled = b.option(bool, "ecs", "Build ECS storage and scheduling") orelse false;
     const resource_graph_enabled = b.option(bool, "resource-graph", "Build the resource graph") orelse false;
@@ -122,7 +123,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_module = b.addModule("spindle_sqlite", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     sqlite_module.addOptions("build_options", sqlite_options);
     configureSqlite(b, sqlite_module, target, optimize);
-    const sqlite_tests = addTest(b, "tests/integration/workflow_sqlite.zig", target, optimize, sqlite_module);
+    const sqlite_tests = addFilteredTest(b, "tests/integration/workflow_sqlite.zig", target, optimize, sqlite_module, test_filter);
     const sqlite_test_dependency = b.lazyDependency("sqlite_amalgamation", .{}) orelse @panic("SQLite dependency is required by test-sqlite");
     sqlite_tests.root_module.addIncludePath(sqlite_test_dependency.path("."));
     const login_fixture = b.createModule(.{ .root_source_file = b.path("tests/fixtures/login_workflow.zig"), .target = target, .optimize = optimize });
@@ -187,6 +188,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(sqlite_step);
 
     const matrix_step = b.step("test-feature-matrix", "Compile supported feature profiles and inspect optional imports");
+    const artifact_inspector = b.addExecutable(.{ .name = "spindle-artifact-inspector", .root_module = b.createModule(.{ .root_source_file = b.path("tests/fixtures/artifact_inspector.zig"), .target = target, .optimize = optimize }) });
     const profiles = [_]struct { name: []const u8, task_graph: bool, ecs: bool, resource_graph: bool, workflow: bool, sqlite: bool, archive: bool, archive_http: bool }{
         .{ .name = "core", .task_graph = false, .ecs = false, .resource_graph = false, .workflow = false, .sqlite = false, .archive = false, .archive_http = false },
         .{ .name = "default", .task_graph = true, .ecs = false, .resource_graph = false, .workflow = true, .sqlite = false, .archive = false, .archive_http = false },
@@ -199,9 +201,14 @@ pub fn build(b: *std.Build) void {
         const module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
         module.addOptions("build_options", options);
         if (profile.sqlite) configureSqlite(b, module, target, optimize);
+        const profile_library = b.addLibrary(.{ .name = b.fmt("spindle-profile-{s}", .{profile.name}), .linkage = .static, .root_module = module });
+        const inspect = b.addRunArtifact(artifact_inspector);
+        inspect.addFileArg(profile_library.getEmittedBin());
+        inspect.addArg(if (profile.sqlite) "+sqlite3_open_v2" else "-sqlite3_open_v2");
+        inspect.addArg(if (profile.archive_http) "+archive_http" else "-archive_http");
+        matrix_step.dependOn(&inspect.step);
         const matrix_tests = addTest(b, "tests/integration/feature_matrix.zig", target, optimize, module);
         matrix_step.dependOn(&b.addRunArtifact(matrix_tests).step);
-        _ = profile.name;
     }
     test_all.dependOn(matrix_step);
 }
@@ -233,12 +240,17 @@ fn addProfileExamples(b: *std.Build, check: *std.Build.Step, target: std.Build.R
 }
 
 fn addTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, spindle: *std.Build.Module) *std.Build.Step.Compile {
+    return addFilteredTest(b, path, target, optimize, spindle, null);
+}
+
+fn addFilteredTest(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, spindle: *std.Build.Module, filter: ?[]const u8) *std.Build.Step.Compile {
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
             .optimize = optimize,
         }),
+        .filters = if (filter) |value| &.{value} else &.{},
     });
     tests.root_module.addImport("spindle", spindle);
     return tests;
