@@ -76,6 +76,10 @@ pub const Scheduler = struct {
     }
     pub fn deinit(self: *Scheduler) void {
         self.shutdown();
+        inline for (0..3) |index| {
+            var drain = DrainContext{ .scheduler = self, .route = @enumFromInt(index) };
+            self.executors[index].helpUntil(&drain, routeRetired);
+        }
         lock(&self.mutex);
         for (self.entries.items) |entry| self.destroyEntry(entry);
         self.entries.deinit(self.allocator);
@@ -178,8 +182,8 @@ pub const Scheduler = struct {
             return;
         }
         entry.state = .running;
-        const version_error = self.validateVersions(entry.accesses);
         self.mutex.unlock();
+        const version_error = self.validateVersions(entry.accesses);
         if (version_error) |err| {
             self.complete(entry, .failed, err);
             return;
@@ -220,6 +224,17 @@ pub const Scheduler = struct {
         self.allocator.destroy(entry);
     }
 };
+
+const DrainContext = struct { scheduler: *Scheduler, route: Route };
+fn routeRetired(raw: *anyopaque) bool {
+    const context: *DrainContext = @ptrCast(@alignCast(raw));
+    lock(&context.scheduler.mutex);
+    defer context.scheduler.mutex.unlock();
+    for (context.scheduler.entries.items) |entry| {
+        if (entry.route == context.route and (!terminal(entry.state) or entry.task.queue_references.load(.acquire) != 0)) return false;
+    }
+    return true;
+}
 
 fn terminal(state: State) bool {
     return state == .completed or state == .failed or state == .cancelled;
@@ -294,4 +309,18 @@ test "incremental scheduler validates versions before callback" {
     try std.testing.expectEqual(@as(usize, 0), calls);
     try std.testing.expect(submission.failure() == error.VersionMismatch);
     try scheduler.release(submission);
+}
+
+test "incremental scheduler deinit retires queued intrusive tasks" {
+    var pump = try executor.PumpExecutor.init(std.testing.allocator, 2);
+    defer pump.deinit();
+    var scheduler = Scheduler.init(std.testing.allocator, pump.executor(), pump.executor(), pump.executor(), null);
+    const Probe = struct {
+        fn run(_: ?*anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    _ = try scheduler.submit(.pump, &.{}, Probe.run, null);
+    scheduler.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pump.outstanding());
 }
