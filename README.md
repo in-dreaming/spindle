@@ -7,7 +7,7 @@ Spindle is a general-purpose Zig runtime for concurrent execution and layered ta
 - ECS for archetype/chunk storage, queries, and conflict-aware system scheduling.
 - Durable Workflow for persistent event-driven state machines, Activities, timers, and recovery.
 
-The project targets Zig `0.16.0` on Windows, Linux, and macOS. Tasks 00-22 are implemented and the repository is in its stabilization phase.
+The project targets Zig `0.16.0` on Windows, Linux, and macOS. Tasks 00-22 and the local-runtime stability pass are complete.
 
 ## Current Status
 
@@ -64,6 +64,44 @@ zig build check -Dworkflow-sqlite=true
 
 `-Dworkflow-sqlite=true` requires Workflow to remain enabled. When SQLite is disabled, its amalgamation is not resolved, compiled, or linked. Disabled subsystems contribute no background threads or runtime initialization cost.
 
+Feature dependencies are explicit: Resource Graph requires Task Graph; SQLite requires Workflow; local archive requires SQLite; HTTP archive requires local archive and Resource Graph. Invalid combinations fail during build configuration instead of silently enabling a partial subsystem.
+
+## Runtime Ownership and Shutdown
+
+The aggregate Runtime owns compute and blocking pools, the caller-thread Pump executor, I/O and observability adapters, detached-task tracking, and, when enabled, SQLite Workflow polling infrastructure. SQLite-disabled builds omit the Workflow configuration field entirely.
+
+SQLite-enabled callers can independently size each polling class and the deterministic command buffer:
+
+```zig
+var runtime = try spindle.runtime.Runtime.init(allocator, .{
+    .io = io,
+    .compute_workers = 4,
+    .blocking_workers = 2,
+    .workflow = .{
+        .database_path = "spindle.db",
+        .tenant = "example",
+        .namespace = "default",
+        .definitions = definitions,
+        .activities = activities,
+        .transport = transport,
+        .workflow_workers = 2,
+        .activity_workers = 4,
+        .timer_workers = 1,
+        .publisher_workers = 1,
+        .command_capacity = 128,
+    },
+});
+defer runtime.deinit();
+```
+
+Shutdown first requests every component to stop, then waits in stages against one monotonic deadline. A finite deadline cancels pending Pump work so caller-thread tasks cannot overrun it; `shutdown(null)` drains Pump work and waits without a deadline. `ShutdownReport` distinguishes a timed-out stage from a worker failure and reports outstanding Workflow workers, executor workers, Pump work, and detached tasks. `deinit` always performs the final unbounded join and release, including after an earlier timeout or worker failure.
+
+## Workflow Archive Storage
+
+The optional archive module exposes one type-erased `archive.Storage` contract with `put` and `get`. `LocalArtifactStore.storage()` and `archive_http.ArtifactStore.storage()` provide the same interface, so archival and verified history reads do not depend on a concrete transport.
+
+Archive locations are lowercase SHA-256 content keys. Before hot history is removed, Spindle writes and reads back the artifact, verifies the envelope checksum, manifest checksum, range, count, location, and continuous event sequence, then commits the archive manifest atomically. History reads repeat these checks while composing archived records with the hot tail.
+
 ## Architecture
 
 Dependencies point downward only:
@@ -99,4 +137,4 @@ The public package entry point is `src/root.zig`. Cross-module code should impor
 
 ## Development State
 
-Changes require formatting, focused acceptance tests, `zig build test-all`, and diff review. Historical task specifications live in `docs/tasks/` as implementation contracts.
+Changes require formatting, focused acceptance tests, `zig build test-all`, minimum/maximum feature-profile compilation, and diff review. Historical task specifications live in `docs/tasks/` as implementation contracts.
