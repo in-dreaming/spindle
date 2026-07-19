@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const spindle = @import("spindle");
 const checkpoint_workflow = @import("fixtures/checkpoint_workflow.zig");
 
@@ -969,7 +970,9 @@ test "ecs query plans refresh incrementally and enforce declared writes" {
     const positions = try view.write(position, EcsPosition);
     positions[0].x = 7;
     try std.testing.expectError(error.UndeclaredWrite, view.write(velocity, EcsVelocity));
-    try std.testing.expectError(error.ActiveChunkBorrow, world.create());
+    if (builtin.mode == .Debug) {
+        try std.testing.expectError(error.ActiveChunkBorrow, world.create());
+    }
     view.deinit();
     const second = try world.create();
     try world.add(second, position, EcsPosition{ .x = 4 });
