@@ -279,6 +279,45 @@ test "thread waiting on an event is released by a later signal" {
     try std.testing.expectEqual(@as(u32, 1), result.load(.acquire));
 }
 
+const EventSetWaitRace = struct {
+    event: *spindle.sync.Event,
+    ready: *spindle.sync.Semaphore,
+    completed: *spindle.sync.Semaphore,
+    iterations: usize,
+    passed: *std.atomic.Value(bool),
+
+    fn run(self: @This()) void {
+        for (0..self.iterations) |_| {
+            self.ready.release(1) catch return;
+            self.event.wait(spindle.platform.park.deadlineAfter(std.time.ns_per_s), .{}) catch return;
+            self.completed.release(1) catch return;
+        }
+        self.passed.store(true, .release);
+    }
+};
+
+test "event set racing the wait observation never loses a wake" {
+    const iterations = 10_000;
+    var event = spindle.sync.Event.init(.auto, false);
+    var ready = try spindle.sync.Semaphore.init(0, 1);
+    var completed = try spindle.sync.Semaphore.init(0, 1);
+    var passed: std.atomic.Value(bool) = .init(false);
+    const thread = try spindle.platform.thread.spawn(.{}, EventSetWaitRace.run, .{EventSetWaitRace{
+        .event = &event,
+        .ready = &ready,
+        .completed = &completed,
+        .iterations = iterations,
+        .passed = &passed,
+    }});
+    defer thread.join();
+    for (0..iterations) |_| {
+        try ready.acquire(spindle.platform.park.deadlineAfter(std.time.ns_per_s), .{});
+        event.set();
+        try completed.acquire(spindle.platform.park.deadlineAfter(std.time.ns_per_s), .{});
+    }
+    try std.testing.expect(passed.load(.acquire));
+}
+
 test "cancellation wakes a thread already blocked on an event" {
     var source: spindle.executor.CancellationSource = .{};
     var event = spindle.sync.Event.init(.manual, false);

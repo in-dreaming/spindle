@@ -23,12 +23,15 @@ pub const Event = struct {
         defer cancel.unregister(&registration);
         while (true) {
             if (cancel.isCancelled()) return error.Cancelled;
+            // Snapshot the futex generation before the signal state.  If set
+            // races this observation, either the state load sees the signal
+            // or futexWait observes a changed generation and does not park.
+            const sequence = self.wait_sequence.load(.acquire);
             const value = self.state.load(.acquire);
             if (value & 1 != 0) {
                 if (self.mode == .auto and self.state.cmpxchgWeak(value, value & ~@as(u32, 1), .acq_rel, .acquire) != null) continue;
                 return;
             }
-            const sequence = self.wait_sequence.load(.acquire);
             if (cancel.isCancelled()) return error.Cancelled;
             park.wait(&self.wait_sequence.raw, sequence, deadline) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
