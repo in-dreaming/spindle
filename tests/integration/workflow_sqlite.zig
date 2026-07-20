@@ -378,7 +378,7 @@ test "real worker kill stages recover without duplicate transitions" {
         const workflow_id = try client.start(.{ .definition_name = "game.login", .definition = login.definition, .input = .{ .schema = login.event_schema, .bytes = "crash" }, .tenant = "crash", .namespace = "test", .idempotency_key = stage, .utc_ms = 300 });
         setup.deinit();
 
-        var child = try std.process.spawn(process_io, .{ .argv = &.{ build_options.crash_fixture, stage, path }, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
+        var child = try std.process.spawn(process_io, .{ .argv = &.{ build_options.crash_fixture, stage, path }, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
         var output_buffer: [16]u8 = undefined;
         var output_reader = child.stdout.?.readerStreaming(process_io, &output_buffer);
         const ready = output_reader.interface.takeArray(6) catch |err| {
@@ -729,7 +729,7 @@ test "real subprocess activity timer and outbox crash stages recover" {
         const setup_worker = spindle.workflow.sqlite_worker.Worker{ .allocator = std.testing.allocator, .store = &setup, .registry = &workflows, .tenant = "crash", .namespace = "test" };
         try std.testing.expect(try setup_worker.runOne());
         setup.deinit();
-        var child = try std.process.spawn(process_io, .{ .argv = &.{ build_options.crash_fixture, stage, path }, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
+        var child = try std.process.spawn(process_io, .{ .argv = &.{ build_options.crash_fixture, stage, path }, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
         var output_buffer: [16]u8 = undefined;
         var output_reader = child.stdout.?.readerStreaming(process_io, &output_buffer);
         const ready = try output_reader.interface.takeArray(6);

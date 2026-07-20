@@ -10,7 +10,7 @@ test "artifact store uses a real local HTTP server process" {
     const directory = "spindle-task14-http";
     std.Io.Dir.cwd().deleteTree(io, directory) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, directory) catch {};
-    var child = try std.process.spawn(process_io, .{ .argv = &.{ "powershell", "-ExecutionPolicy", "Bypass", "-File", build_options.server_script, directory, "19007" }, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
+    var child = try std.process.spawn(process_io, .{ .argv = &.{ "powershell", "-ExecutionPolicy", "Bypass", "-File", build_options.server_script, directory, "19007" }, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe, .create_no_window = true });
     defer child.kill(process_io);
     var ready_buffer: [16]u8 = undefined;
     var ready_reader = child.stdout.?.readerStreaming(process_io, &ready_buffer);

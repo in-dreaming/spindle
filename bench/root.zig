@@ -46,7 +46,7 @@ fn runParallelFor(allocator: std.mem.Allocator) void {
     const started = std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake);
     spindle.parallel.forRange(allocator, pool.executor(), .{ .end = 65_536 }, .{ .grain = 1024 }, &probe, ParallelBench.run) catch return;
     const elapsed: u64 = @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds - started.raw.nanoseconds);
-    std.debug.print("{{\"benchmark\":\"parallel_for\",\"grain\":1024,\"items\":{d},\"elapsed_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ total.load(.acquire), elapsed, @tagName(builtin.os.tag) });
+    std.debug.print("{{\"schema_version\":1,\"benchmark\":\"parallel_for\",\"grain\":1024,\"items\":{d},\"elapsed_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ total.load(.acquire), elapsed, @tagName(builtin.os.tag) });
 }
 
 fn runWorkload(allocator: std.mem.Allocator, work_ns: u64) void {
@@ -69,7 +69,7 @@ fn runWorkload(allocator: std.mem.Allocator, work_ns: u64) void {
     const elapsed: u64 = @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds - started.raw.nanoseconds);
     std.sort.pdq(u64, latencies, {}, std.sort.asc(u64));
     const throughput = @as(u64, @intCast(count)) * std.time.ns_per_s / @max(@as(u64, 1), elapsed);
-    std.debug.print("{{\"benchmark\":\"fixed_pool\",\"work_ns\":{d},\"samples\":{d},\"throughput\":{d},\"latency_ns\":{d},\"p50_ns\":{d},\"p95_ns\":{d},\"p99_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ work_ns, count, throughput, elapsed / @as(u64, @intCast(count)), percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99), @tagName(builtin.os.tag) });
+    std.debug.print("{{\"schema_version\":1,\"benchmark\":\"fixed_pool\",\"work_ns\":{d},\"samples\":{d},\"throughput\":{d},\"latency_ns\":{d},\"p50_ns\":{d},\"p95_ns\":{d},\"p99_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ work_ns, count, throughput, elapsed / @as(u64, @intCast(count)), percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99), @tagName(builtin.os.tag) });
 }
 
 const EcsPosition = struct { value: u32 };
@@ -99,7 +99,7 @@ fn runEcsScheduler(allocator: std.mem.Allocator) void {
     world.update(.{ .compute = pool.executor() }, 1.0) catch return;
     const elapsed: u64 = @intCast(std.Io.Clock.Timestamp.now(std.Options.debug_io, .awake).raw.nanoseconds - started.raw.nanoseconds);
     const throughput = @as(u64, 16_384) * std.time.ns_per_s / @max(@as(u64, 1), elapsed);
-    std.debug.print("{{\"benchmark\":\"ecs_scheduler\",\"entities\":16384,\"chunk_range_jobs\":{d},\"throughput\":{d},\"elapsed_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ probe.ranges.load(.acquire), throughput, elapsed, @tagName(builtin.os.tag) });
+    std.debug.print("{{\"schema_version\":1,\"benchmark\":\"ecs_scheduler\",\"entities\":16384,\"chunk_range_jobs\":{d},\"throughput\":{d},\"elapsed_ns\":{d},\"os\":\"{s}\",\"workers\":2}}\n", .{ probe.ranges.load(.acquire), throughput, elapsed, @tagName(builtin.os.tag) });
 }
 
 fn percentile(values: []const u64, percent: usize) u64 {

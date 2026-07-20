@@ -6,7 +6,8 @@
 
 - 仓库目前只有 `README.md`、`LICENSE` 和 `docs/arch.md`，没有 Zig 工程、源码、依赖或测试基础设施。
 - 语言和标准库固定为 Zig `0.16.0`，不得用旧版 API 猜测实现；以该版本随附的标准库源码和 `zig std` 为准。
-- 包名为 `spindle`，公开入口为 `src/root.zig`，实现位于 `src/zruntime/<module>/`。
+- 包名为 `spindle`，完整公开入口为`src/root.zig`；CPU执行器窄入口为
+  `src/executor.zig` / `spindle_executor`，实现位于`src/zruntime/<module>/`。
 - 首批桌面目标为 Windows、Linux、macOS。平台专有实现必须有编译期分派，不能让不相关平台解析或链接专有符号。
 - 架构包含四套独立上层语义：Local Task Graph、Resource Graph、ECS、Durable Workflow。它们可共享 core、executor、codec、clock、trace，但禁止共享节点、状态机、调度器和持久化模型。
 

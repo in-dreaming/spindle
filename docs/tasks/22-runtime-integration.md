@@ -16,6 +16,10 @@ Assemble the public Runtime while preserving the independent semantics and compi
 - Disabled modules are not parsed/compiled, linked, initialized or represented by background threads. They may expose a small compile-time unavailable marker only if required for a stable aggregate root.
 - Generate a build-options module and use compile-time branches at module roots; do not scatter runtime booleans through hot paths.
 - Add a feature-matrix build test and binary/import inspection proving SQLite and optional adapter symbols are absent when disabled.
+- Publish `spindle_executor` from `src/executor.zig` as a build-options-free narrow
+  entry point. It exports only the executor namespace and must not expose or
+  require Runtime, parallel algorithms, Local Task Graph, ECS, Resource Graph,
+  Workflow, I/O or observability.
 
 ## Runtime assembly
 
@@ -42,6 +46,8 @@ Deadline expiry returns a report of outstanding work and never frees memory stil
 - SQLite durable workflow example uses a temporary/local database path and performs a real stop/reopen recovery; no DSN or external service.
 - Runtime end-to-end test may route Workflow Activity through optional Resource Graph and Local Graph only when all relevant flags are enabled.
 - Dependency-boundary checker, feature matrix, shutdown fault injection, inspector protocol and replay bundle are mandatory.
+- The executor-only entry has its own import/run test and is part of `test-all`;
+  upper module declarations on that root are a release failure.
 - Inspector/replay formats describe only enabled modules and never query private SQLite tables directly.
 
 ## Release gate
@@ -54,6 +60,7 @@ Deadline expiry returns a report of outstanding work and never frees memory stil
 ## Acceptance checklist
 
 - [ ] Every optional subsystem is absent from disabled builds, including dependencies and threads.
+- [ ] `spindle_executor` remains a minimal standalone public module with no upper-model declarations.
 - [ ] All feature combinations either build or fail with an intentional configuration error.
 - [ ] Runtime initialization/shutdown is leak-free under injected failures.
 - [ ] No PostgreSQL, libpq, DSN or Docker requirement remains.

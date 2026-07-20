@@ -1,5 +1,7 @@
+const std = @import("std");
 const spindle = @import("spindle");
 
 pub fn main() void {
-    _ = spindle.resource_graph.ResourceTaskGraph;
+    var graph = spindle.resource_graph.ResourceTaskGraph.init(std.heap.page_allocator);
+    defer graph.deinit();
 }

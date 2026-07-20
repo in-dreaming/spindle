@@ -26,6 +26,7 @@ jobs:
           key: ${{ runner.os }}-zig-0.16.0-${{ hashFiles('build.zig.zon') }}
       - run: zig build --fetch=all
       - run: zig build test-all --system zig-pkg
+      - run: zig build release-check -Doptimize=ReleaseSafe --system zig-pkg
 
   bench-smoke:
     runs-on: ubuntu-latest

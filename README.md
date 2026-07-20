@@ -35,9 +35,16 @@ zig build test-sqlite
 zig build test-feature-matrix
 zig build bench -Doptimize=ReleaseFast
 zig build test-all
+zig build release-check -Doptimize=ReleaseSafe
 ```
 
-`test-all` runs compile checks, unit/integration tests, bounded stress, feature-boundary checks, and real temporary-file SQLite suites. No external database service is needed.
+`check` runs the examples available in the selected feature profile. `test-all`
+runs unit/integration tests, bounded stress, feature-boundary checks, every
+supported-profile example, and real temporary-file SQLite suites. The SQLite
+suite also runs `examples/workflow_sqlite_recovery.zig`, which stops and reopens
+a local database before verifying its workflow record. `release-check` adds API
+documentation, license installation, ReleaseSafe profile artifacts, and the
+versioned benchmark schema. No external database service is needed.
 
 Increase bounded stress coverage with:
 
@@ -63,6 +70,12 @@ zig build check -Dworkflow-sqlite=true
 `-Dworkflow-sqlite=true` requires Workflow to remain enabled. When SQLite is disabled, its amalgamation is not resolved, compiled, or linked. Disabled subsystems contribute no background threads or runtime initialization cost.
 
 Feature dependencies are explicit: Resource Graph requires Task Graph; SQLite requires Workflow; local archive requires SQLite; HTTP archive requires local archive and Resource Graph. Invalid combinations fail during build configuration instead of silently enabling a partial subsystem.
+
+Consumers that only require CPU execution should import the public
+`spindle_executor` module. Its root is `src/executor.zig` and intentionally has
+no Runtime, parallel algorithm, Local Task Graph, ECS, Resource Graph, Workflow,
+I/O, or observability declarations. Domain libraries remain responsible for
+their own work partitioning, result ordering, and state publication.
 
 ## Runtime Ownership and Shutdown
 
