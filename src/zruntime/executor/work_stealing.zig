@@ -197,15 +197,18 @@ pub const WorkStealingExecutor = struct {
                 continue;
             }
             if (worker.state.stopping.load(.acquire)) break;
+            var executed_during_spin = false;
             for (0..32) |_| {
                 if (takeTask(worker)) |task| {
                     task.releaseQueueReference();
                     task.execute();
                     _ = worker.executed.fetchAdd(1, .monotonic);
+                    executed_during_spin = true;
                     break;
                 }
                 std.atomic.spinLoopHint();
             }
+            if (executed_during_spin) continue;
             _ = worker.idle.fetchAdd(1, .monotonic);
             _ = worker.state.sleeping.fetchAdd(1, .acq_rel);
             // Close the submit-vs-park window: a submit that observed no sleeper is now visible here.
