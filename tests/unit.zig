@@ -377,6 +377,51 @@ const TaskProbe = struct {
     }
 };
 
+test "Task wait includes completion callback lifetime" {
+    const CompletionProbe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(_: *spindle.executor.Task) void {}
+        fn complete(task: *spindle.executor.Task) void {
+            const self: *@This() = @ptrCast(@alignCast(task.completion_context.?));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            self.finished.store(true, .release);
+        }
+        fn execute(task: *spindle.executor.Task) void {
+            task.execute();
+        }
+        fn wait(task: *spindle.executor.Task, started: *std.atomic.Value(bool), returned: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            task.wait() catch unreachable;
+            returned.store(true, .release);
+        }
+    };
+
+    var probe = CompletionProbe{};
+    var task = spindle.executor.Task.init(CompletionProbe.run, null);
+    task.complete_fn = CompletionProbe.complete;
+    task.completion_context = &probe;
+    try std.testing.expect(task.tryQueue());
+    var execute_thread = try std.Thread.spawn(.{}, CompletionProbe.execute, .{&task});
+    while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var waiter_started = std.atomic.Value(bool).init(false);
+    var waiter_returned = std.atomic.Value(bool).init(false);
+    var wait_thread = try std.Thread.spawn(.{}, CompletionProbe.wait, .{ &task, &waiter_started, &waiter_returned });
+    while (!waiter_started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..1_000) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!waiter_returned.load(.acquire));
+
+    probe.release.store(true, .release);
+    execute_thread.join();
+    wait_thread.join();
+    try std.testing.expect(probe.finished.load(.acquire));
+    try std.testing.expect(waiter_returned.load(.acquire));
+}
+
 test "inline executor executes once and rejects duplicate submission" {
     var value: std.atomic.Value(u32) = .init(0);
     var probe = TaskProbe{ .value = &value };

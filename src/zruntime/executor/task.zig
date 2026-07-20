@@ -29,8 +29,8 @@ pub const Task = struct {
     }
     pub fn cancel(self: *Task) bool {
         if (self.state.cmpxchgStrong(.queued, .cancelled, .acq_rel, .acquire) == null) {
-            self.done.set();
             if (self.complete_fn) |callback| callback(self);
+            self.done.set();
             return true;
         }
         return false;
@@ -39,8 +39,8 @@ pub const Task = struct {
         if (self.state.cmpxchgStrong(.queued, .running, .acq_rel, .acquire) != null) return;
         self.run_fn(self);
         if (self.state.load(.acquire) == .running) self.state.store(.completed, .release);
-        self.done.set();
         if (self.complete_fn) |callback| callback(self);
+        self.done.set();
     }
     pub fn wait(self: *Task) !void {
         try self.done.wait(null, .{});
