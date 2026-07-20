@@ -175,8 +175,8 @@ pub const WorkStealingExecutor = struct {
         const worker = currentWorker() orelse return false;
         if (worker.state != self.state) return false;
         if (takeTask(worker)) |task| {
-            task.execute();
             task.releaseQueueReference();
+            task.execute();
             _ = worker.executed.fetchAdd(1, .monotonic);
             return true;
         }
@@ -191,16 +191,16 @@ pub const WorkStealingExecutor = struct {
         defer current_worker = null;
         while (true) {
             if (takeTask(worker)) |task| {
-                task.execute();
                 task.releaseQueueReference();
+                task.execute();
                 _ = worker.executed.fetchAdd(1, .monotonic);
                 continue;
             }
             if (worker.state.stopping.load(.acquire)) break;
             for (0..32) |_| {
                 if (takeTask(worker)) |task| {
-                    task.execute();
                     task.releaseQueueReference();
+                    task.execute();
                     _ = worker.executed.fetchAdd(1, .monotonic);
                     break;
                 }
@@ -211,8 +211,8 @@ pub const WorkStealingExecutor = struct {
             // Close the submit-vs-park window: a submit that observed no sleeper is now visible here.
             if (takeTask(worker)) |task| {
                 _ = worker.state.sleeping.fetchSub(1, .acq_rel);
-                task.execute();
                 task.releaseQueueReference();
+                task.execute();
                 _ = worker.executed.fetchAdd(1, .monotonic);
                 continue;
             }
